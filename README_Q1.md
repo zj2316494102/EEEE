@@ -31,13 +31,13 @@ source /usr/local/iCompute/etc/profile.d/conda.sh
 conda activate eeeeee
 cd /home/user/EEEEEE
 tmux new -s eeeeee-q1
-bash scripts/run_q1.sh --run-id 20260923_q1_001 --config configs/q1.yaml
+bash tools/run_q1.sh --run-id 20260923_q1_001 --config configs/q1.yaml
 ```
 
 试运行可以使用：
 
 ```bash
-bash scripts/run_q1.sh --run-id 20260923_q1_smoke --limit 1 --allow-failures --skip-model-hash
+bash tools/run_q1.sh --run-id 20260923_q1_smoke --limit 1 --allow-failures --skip-model-hash
 ```
 
 运行完成后，只有出现 `runs/<run_id>/DONE` 才下载结果。结果包括 `outputs/q1_submission/` 和 `outputs/q1_audit/`。
@@ -57,11 +57,10 @@ vision [N, 50, 768] float16
 ## 验证
 
 ```bash
-bash scripts/validate_q1.sh \
+bash tools/validate_q1.sh \
   --artifact runs/20260923_q1_001/outputs/q1_submission/q1_aligned_50.pkl \
   --manifest runs/20260923_q1_001/outputs/q1_submission/manifest.csv \
   --expected-count 100
 ```
 
 压缩包不包含模型权重、缓存、未对齐审计文件或身份信息。提交前检查 `package_size.json` 中的 `within_limit`。
-
