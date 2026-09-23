@@ -279,6 +279,10 @@ def _empty_result(config: Q1Config, entry: dict[str, Any], reason: str) -> dict[
             "text_fallback_ratio": 0.0,
             "text_lexical_asr_word_count": 0,
             "text_review_status": "processing_failed_manual_review",
+            "text_asr_retry_used": 0,
+            "text_asr_retry_selected": 0,
+            "text_asr_selected_profile": "none",
+            "text_asr_attempt_count": 0,
             "audio_valid_ratio": 0.0,
             "vision_valid_ratio": 0.0,
             "vision_face_detection_ratio": 0.0,
@@ -309,16 +313,83 @@ def process_sample(
     grid = make_time_grid(duration, config.aligned_length)
     sample_rate = int(config.get("audio_sample_rate", 16000))
     audio = extract_audio(Path(entry["video_path"]), sample_rate)
-    asr_words = asr_aligner.extract(audio, duration)
     text_raw = text_extractor.extract(entry["raw_text"])
-    aligned_words = align_text_words(
-        entry["raw_text"],
-        asr_words,
+
+    def align_candidate(candidate_words: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return align_text_words(
+            entry["raw_text"],
+            candidate_words,
+            duration,
+            max_edit_ratio=float(config.get("text_match_max_edit_ratio", 0.40)),
+            fallback_confidence=float(config.get("text_fallback_confidence", 0.20)),
+            fallback_min_interval_s=float(config.get("text_fallback_min_interval_s", 0.01)),
+        )
+
+    def candidate_summary(candidate_words: list[dict[str, Any]], candidate_records: list[dict[str, Any]]) -> dict[str, Any]:
+        fallback_count = int(sum(bool(item.get("fallback")) for item in candidate_records))
+        invalid_count = int(sum(not bool(item.get("time_valid")) for item in candidate_records))
+        exact_count = int(sum(item.get("match_type") == "exact" for item in candidate_records))
+        edit_count = int(
+            sum(item.get("match_type") in {"edit_distance", "equivalent_compound"} for item in candidate_records)
+        )
+        lexical_count = int(sum(bool(re.search(r"[A-Za-z0-9]", str(item.get("text", "")))) for item in candidate_words))
+        return {
+            "asr_word_count": int(len(candidate_words)),
+            "lexical_asr_word_count": lexical_count,
+            "fallback_count": fallback_count,
+            "fallback_ratio": fallback_count / max(len(candidate_records), 1),
+            "invalid_timestamp_count": invalid_count,
+            "exact_match_count": exact_count,
+            "edit_match_count": edit_count,
+            "matched_count": int(len(candidate_records) - fallback_count),
+        }
+
+    baseline_profile = "baseline"
+    asr_words = asr_aligner.extract(
+        audio,
         duration,
-        max_edit_ratio=float(config.get("text_match_max_edit_ratio", 0.34)),
-        fallback_confidence=float(config.get("text_fallback_confidence", 0.20)),
-        fallback_min_interval_s=float(config.get("text_fallback_min_interval_s", 0.01)),
+        num_beams=int(config.get("asr_num_beams", 1)),
+        temperature=float(config.get("asr_temperature", 0.0)),
+        sample_rate=sample_rate,
     )
+    aligned_words = align_candidate(asr_words)
+    baseline_summary = candidate_summary(asr_words, aligned_words)
+    selected_profile = baseline_profile
+    retry_used = False
+    retry_selected = False
+    asr_attempts = [{"profile": baseline_profile, **baseline_summary}]
+    retry_threshold = float(config.get("asr_retry_min_fallback_ratio", 0.50))
+    retry_triggered = bool(
+        config.get("asr_retry_enabled", True)
+        and (
+            baseline_summary["fallback_ratio"] >= retry_threshold
+            or baseline_summary["lexical_asr_word_count"] == 0
+        )
+    )
+    if retry_triggered:
+        retry_profile = "retry_beam3_temperature0.2_context0.5"
+        retry_words = asr_aligner.extract(
+            audio,
+            duration,
+            num_beams=int(config.get("asr_retry_num_beams", 3)),
+            temperature=float(config.get("asr_retry_temperature", 0.20)),
+            context_s=float(config.get("asr_retry_context_s", 0.50)),
+            sample_rate=sample_rate,
+        )
+        retry_aligned_words = align_candidate(retry_words)
+        retry_summary = candidate_summary(retry_words, retry_aligned_words)
+        asr_attempts.append({"profile": retry_profile, **retry_summary})
+        retry_used = True
+        if (
+            retry_summary["fallback_count"] < baseline_summary["fallback_count"]
+            and retry_summary["invalid_timestamp_count"] <= baseline_summary["invalid_timestamp_count"]
+            and retry_summary["matched_count"] >= baseline_summary["matched_count"]
+        ):
+            asr_words = retry_words
+            aligned_words = retry_aligned_words
+            selected_profile = retry_profile
+            retry_selected = True
+    selected_summary = candidate_summary(asr_words, aligned_words)
     valid_text_positions = [
         position
         for position, index in enumerate(text_raw.word_indices)
@@ -380,8 +451,8 @@ def process_sample(
     )
     vision_mask = np.minimum(vision_mask, emotion_mask).astype(np.uint8)
 
-    text_fallback_count = int(sum(bool(item.get("fallback")) for item in aligned_words))
-    text_invalid_timestamp_count = int(sum(not bool(item.get("time_valid")) for item in aligned_words))
+    text_fallback_count = int(selected_summary["fallback_count"])
+    text_invalid_timestamp_count = int(selected_summary["invalid_timestamp_count"])
     text_fallback_ratio = text_fallback_count / max(len(aligned_words), 1)
     text_low_confidence_ratio = float(text_low_confidence_mask.mean())
     vision_valid_ratio = float(vision_mask.mean())
@@ -403,7 +474,7 @@ def process_sample(
         source = str(item.get("timestamp_source", "unknown"))
         source_counts[source] = source_counts.get(source, 0) + 1
     text_timestamp_source = ";".join(f"{key}:{source_counts[key]}" for key in sorted(source_counts))
-    lexical_asr_count = sum(bool(re.search(r"[A-Za-z0-9]", str(item.get("text", "")))) for item in asr_words)
+    lexical_asr_count = int(selected_summary["lexical_asr_word_count"])
     if text_fallback_ratio >= 0.999999:
         if lexical_asr_count == 0:
             text_review_status = "asr_empty_or_nonlexical_manual_review"
@@ -428,14 +499,18 @@ def process_sample(
         "vision_valid_ratio": vision_valid_ratio,
         "text_word_count": len(aligned_words),
         "text_asr_word_count": len(asr_words),
-        "text_exact_match_count": sum(item["match_type"] == "exact" for item in aligned_words),
-        "text_edit_match_count": sum(item["match_type"] == "edit_distance" for item in aligned_words),
+        "text_exact_match_count": int(selected_summary["exact_match_count"]),
+        "text_edit_match_count": int(selected_summary["edit_match_count"]),
         "text_fallback_count": text_fallback_count,
         "text_fallback_ratio": text_fallback_ratio,
         "text_invalid_timestamp_count": text_invalid_timestamp_count,
         "text_timestamp_source": text_timestamp_source,
         "text_lexical_asr_word_count": lexical_asr_count,
         "text_review_status": text_review_status,
+        "text_asr_retry_used": int(retry_used),
+        "text_asr_retry_selected": int(retry_selected),
+        "text_asr_selected_profile": selected_profile,
+        "text_asr_attempt_count": len(asr_attempts),
         "audio_raw_frame_count": int(len(audio_raw.features)),
         "audio_decoded_duration": float(len(audio) / max(sample_rate, 1)),
         "vision_raw_frame_count": int(vision_raw.frame_count),
@@ -460,6 +535,7 @@ def process_sample(
             "word_indices": valid_text_indices,
             "invalid_word_indices": [index for index, item in enumerate(aligned_words) if not item.get("time_valid")],
             "asr_words": asr_words,
+            "asr_attempts": asr_attempts,
             "overflow_chunks": text_raw.overflow_chunks,
         },
         "audio": {
@@ -560,7 +636,7 @@ vision [N, 50, 768]
 
 The Question 2 and Question 3 models must continue to use attachment 2's `768/74/35` interface. This artifact is not a replacement for attachment 2.
 
-The provided transcript is retained as `raw_text`. Whisper word timestamps are used only to locate the provided words in time. The 50 bins are proportional half-open intervals over `duration_alignment`, which follows the edit-list-aware FFmpeg presentation timeline. The source container/movie-header (`mvhd`) duration is retained separately as `duration_container` for auditing. Each feature is pooled by temporal overlap and quality weight. Invalid bins are zero after standardization and have mask value 0.
+The provided transcript is retained as `raw_text`. Whisper word timestamps are used only to locate the provided words in time. Text matching uses conservative normalization plus monotonic dynamic programming; high-fallback samples may receive one logged beam/temperature retry, and the retry is selected only when it improves coverage without increasing invalid timestamps. The 50 bins are proportional half-open intervals over `duration_alignment`, which follows the edit-list-aware FFmpeg presentation timeline. The source container/movie-header (`mvhd`) duration is retained separately as `duration_container` for auditing. Each feature is pooled by temporal overlap and quality weight. Invalid bins are zero after standardization and have mask value 0.
 
 Run ID: `{run_id}`  
 Config hash: `{config.config_hash}`  
@@ -933,6 +1009,10 @@ def run_pipeline(
                     "text_timestamp_source": result["stats"]["text_timestamp_source"],
                     "text_lexical_asr_word_count": result["stats"]["text_lexical_asr_word_count"],
                     "text_review_status": result["stats"]["text_review_status"],
+                    "text_asr_retry_used": result["stats"]["text_asr_retry_used"],
+                    "text_asr_retry_selected": result["stats"]["text_asr_retry_selected"],
+                    "text_asr_selected_profile": result["stats"]["text_asr_selected_profile"],
+                    "text_asr_attempt_count": result["stats"]["text_asr_attempt_count"],
                     "failure_reason": result["failure_reason"],
                 }
             )
@@ -975,7 +1055,8 @@ def run_pipeline(
             "vision_face_detection_ratio", "vision_imputed_ratio", "text_fallback_count", "text_fallback_ratio",
             "text_word_count", "text_asr_word_count", "text_invalid_timestamp_count",
             "text_low_confidence_ratio", "text_timestamp_source", "failure_reason", "sha256",
-            "text_lexical_asr_word_count", "text_review_status",
+            "text_lexical_asr_word_count", "text_review_status", "text_asr_retry_used",
+            "text_asr_retry_selected", "text_asr_selected_profile", "text_asr_attempt_count",
         ]
         write_csv(manifest_rows, submission_dir / "manifest.csv", manifest_fields)
         alignment_fields = sorted({key for row in alignment_rows for key in row})
@@ -991,6 +1072,10 @@ def run_pipeline(
                     "fallback_ratio": result["stats"]["text_fallback_ratio"],
                     "invalid_timestamp_count": result["stats"]["text_invalid_timestamp_count"],
                     "review_status": result["stats"]["text_review_status"],
+                    "asr_retry_used": result["stats"]["text_asr_retry_used"],
+                    "asr_retry_selected": result["stats"]["text_asr_retry_selected"],
+                    "asr_selected_profile": result["stats"]["text_asr_selected_profile"],
+                    "asr_attempt_count": result["stats"]["text_asr_attempt_count"],
                     "asr_words": result["raw_audit"].get("text", {}).get("asr_words", []),
                 }
                 for entry, result in zip(manifest, results)
@@ -998,7 +1083,8 @@ def run_pipeline(
             submission_dir / "text_review.csv",
             [
                 "id", "raw_text", "asr_word_count", "lexical_asr_word_count", "fallback_count",
-                "fallback_ratio", "invalid_timestamp_count", "review_status", "asr_words",
+                "fallback_ratio", "invalid_timestamp_count", "review_status", "asr_retry_used",
+                "asr_retry_selected", "asr_selected_profile", "asr_attempt_count", "asr_words",
             ],
         )
         write_csv(
@@ -1013,6 +1099,10 @@ def run_pipeline(
                     "invalid_timestamp_count": result["stats"]["text_invalid_timestamp_count"],
                     "review_status": result["stats"]["text_review_status"],
                     "manual_review_required": int(result["stats"]["text_review_status"] != "normal"),
+                    "asr_retry_used": result["stats"]["text_asr_retry_used"],
+                    "asr_retry_selected": result["stats"]["text_asr_retry_selected"],
+                    "asr_selected_profile": result["stats"]["text_asr_selected_profile"],
+                    "asr_attempt_count": result["stats"]["text_asr_attempt_count"],
                     "conclusion": _text_review_conclusion(result["stats"]),
                 }
                 for entry, result in zip(manifest, results)
@@ -1021,7 +1111,7 @@ def run_pipeline(
             [
                 "id", "word_count", "asr_word_count", "lexical_asr_word_count", "fallback_count",
                 "fallback_ratio", "invalid_timestamp_count", "review_status", "manual_review_required",
-                "conclusion",
+                "asr_retry_used", "asr_retry_selected", "asr_selected_profile", "asr_attempt_count", "conclusion",
             ],
         )
         duration_fields = [

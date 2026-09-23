@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import difflib
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -10,6 +9,43 @@ import numpy as np
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:['’\-][A-Za-z0-9]+)*")
+
+COMMON_WORD_EQUIVALENTS = {
+    "cant": "cannot",
+    "cannot": "cannot",
+    "wont": "willnot",
+    "willnot": "willnot",
+    "dont": "donot",
+    "donot": "donot",
+    "doesnt": "doesnot",
+    "doesnot": "doesnot",
+    "didnt": "didnot",
+    "didnot": "didnot",
+    "isnt": "isnot",
+    "isnot": "isnot",
+    "arent": "arenot",
+    "arenot": "arenot",
+    "wasnt": "wasnot",
+    "werent": "werenot",
+    "im": "iam",
+    "iam": "iam",
+    "ive": "ihave",
+    "ihave": "ihave",
+    "ill": "iwill",
+    "iwill": "iwill",
+    "id": "iwould",
+    "iwould": "iwould",
+    "youre": "youare",
+    "youare": "youare",
+    "theyre": "theyare",
+    "theyare": "theyare",
+    "weve": "wehave",
+    "wehave": "wehave",
+    "theyve": "theyhave",
+    "theyhave": "theyhave",
+    "thats": "thatis",
+    "thatis": "thatis",
+}
 
 
 @dataclass
@@ -25,6 +61,12 @@ def normalize_token(value: str) -> str:
     value = value.replace("’", "'").replace("‘", "'").replace("–", "-").replace("—", "-")
     value = re.sub(r"[^a-z0-9']+", "", value)
     return value
+
+
+def normalize_match_key(value: str) -> str:
+    """Return a conservative key used only for matching, never for output text."""
+    normalized = normalize_token(value).replace("'", "")
+    return COMMON_WORD_EQUIVALENTS.get(normalized, normalized)
 
 
 def tokenize_text(text: str) -> list[TextToken]:
@@ -65,6 +107,97 @@ def _similar_enough(left: str, right: str, max_ratio: float) -> bool:
     distance = _levenshtein(left, right)
     denominator = max(len(left), len(right), 1)
     return distance / denominator <= max_ratio
+
+
+def _match_candidate(
+    target_keys: list[str],
+    source_keys: list[str],
+    target_start: int,
+    target_count: int,
+    source_start: int,
+    source_count: int,
+    max_edit_ratio: float,
+) -> tuple[str, float] | None:
+    target_key = "".join(target_keys[target_start : target_start + target_count])
+    source_key = "".join(source_keys[source_start : source_start + source_count])
+    if not target_key or not source_key:
+        return None
+    if target_key == source_key:
+        if target_count == 1 and source_count == 1:
+            return "exact", 3.0
+        return "equivalent_compound", 2.65
+    if target_count == 1 and source_count == 1 and _similar_enough(target_key, source_key, max_edit_ratio):
+        ratio = _levenshtein(target_key, source_key) / max(len(target_key), len(source_key), 1)
+        return "edit_distance", 1.25 - ratio
+    return None
+
+
+def _monotonic_alignment_pairs(
+    target_keys: list[str],
+    source_keys: list[str],
+    max_edit_ratio: float,
+) -> list[tuple[list[int], list[int], str]]:
+    """Align two short word sequences with monotonic DP and auditable operations."""
+    target_count = len(target_keys)
+    source_count = len(source_keys)
+    scores = np.full((target_count + 1, source_count + 1), -np.inf, dtype=np.float64)
+    operations: dict[tuple[int, int], tuple[int, int, str, str]] = {}
+    scores[0, 0] = 0.0
+
+    def update(
+        next_i: int,
+        next_j: int,
+        score: float,
+        previous_i: int,
+        previous_j: int,
+        operation: str,
+        match_type: str = "",
+    ) -> None:
+        if score > scores[next_i, next_j] + 1e-9:
+            scores[next_i, next_j] = score
+            operations[(next_i, next_j)] = (previous_i, previous_j, operation, match_type)
+
+    for i in range(target_count + 1):
+        for j in range(source_count + 1):
+            if not np.isfinite(scores[i, j]):
+                continue
+            if i < target_count:
+                update(i + 1, j, scores[i, j] - 0.75, i, j, "skip_target")
+            if j < source_count:
+                update(i, j + 1, scores[i, j] - 0.15, i, j, "skip_source")
+            for target_span, source_span in ((1, 1), (1, 2), (2, 1)):
+                if i + target_span > target_count or j + source_span > source_count:
+                    continue
+                candidate = _match_candidate(
+                    target_keys,
+                    source_keys,
+                    i,
+                    target_span,
+                    j,
+                    source_span,
+                    max_edit_ratio,
+                )
+                if candidate is None:
+                    continue
+                match_type, match_score = candidate
+                update(i + target_span, j + source_span, scores[i, j] + match_score, i, j, "match", match_type)
+
+    pairs: list[tuple[list[int], list[int], str]] = []
+    i, j = target_count, source_count
+    while i > 0 or j > 0:
+        previous = operations.get((i, j))
+        if previous is None:
+            if i > 0:
+                i -= 1
+            elif j > 0:
+                j -= 1
+            continue
+        previous_i, previous_j, operation, match_type = previous
+        if operation == "match":
+            pairs.append((list(range(previous_i, i)), list(range(previous_j, j)), match_type))
+        i, j = previous_i, previous_j
+    pairs.reverse()
+    return pairs
 
 
 def _clip_interval(start: float, end: float, duration: float) -> tuple[float, float]:
@@ -165,6 +298,7 @@ def align_text_words(
                 "source_index": index,
                 "raw": text,
                 "normalized": normalized,
+                "match_key": normalize_match_key(normalized),
                 "start": start,
                 "end": end,
                 "confidence": float(item.get("confidence", 1.0) or 1.0),
@@ -172,7 +306,9 @@ def align_text_words(
         )
 
     target_tokens = [item.normalized for item in target]
+    target_keys = [normalize_match_key(item) for item in target_tokens]
     source_tokens = [item["normalized"] for item in source]
+    source_keys = [item["match_key"] for item in source]
     records: list[dict[str, Any]] = [
         {
             "word": item.raw,
@@ -193,38 +329,25 @@ def align_text_words(
         for item in target
     ]
 
-    matcher = difflib.SequenceMatcher(a=target_tokens, b=source_tokens, autojunk=False)
-    for tag, target_start, target_end, source_start, source_end in matcher.get_opcodes():
-        if tag == "equal":
-            pairs = [(target_start + offset, source_start + offset) for offset in range(target_end - target_start)]
-            match_type = "exact"
-        elif tag == "replace":
-            count = min(target_end - target_start, source_end - source_start)
-            pairs = []
-            for offset in range(count):
-                ti = target_start + offset
-                si = source_start + offset
-                if _similar_enough(target_tokens[ti], source_tokens[si], max_edit_ratio):
-                    pairs.append((ti, si))
-            match_type = "edit_distance"
+    for target_indices, source_indices, match_type in _monotonic_alignment_pairs(
+        target_keys, source_keys, max_edit_ratio
+    ):
+        source_items = [source[index] for index in source_indices]
+        start = min(item["start"] for item in source_items)
+        end = max(item["end"] for item in source_items)
+        valid_interval = _float32_interval(start, end, duration)
+        base_confidence = min(float(np.clip(item.get("confidence", 1.0), 0.0, 1.0)) for item in source_items)
+        if match_type == "exact":
+            confidence = max(base_confidence, 1.0)
+            timestamp_source = "asr_exact"
+        elif match_type == "equivalent_compound":
+            confidence = min(base_confidence, 0.85)
+            timestamp_source = "asr_equivalent"
         else:
-            pairs = []
-            match_type = "unmatched"
-
-        for ti, si in pairs:
-            current = records[ti]
-            item = source[si]
-            if current["matched"]:
-                current["start"] = min(float(current["start"]), item["start"])
-                current["end"] = max(float(current["end"]), item["end"])
-                current["source_indices"].append(item["source_index"])
-                continue
-            confidence = float(np.clip(item.get("confidence", 1.0), 0.0, 1.0))
-            if match_type == "exact":
-                confidence = max(confidence, 0.90)
-            else:
-                confidence = min(confidence, 0.65)
-            valid_interval = _float32_interval(item["start"], item["end"], duration)
+            confidence = min(base_confidence, 0.65)
+            timestamp_source = "asr_edit"
+        for target_index in target_indices:
+            current = records[target_index]
             current.update(
                 {
                     "start": valid_interval[0] if valid_interval is not None else None,
@@ -232,10 +355,10 @@ def align_text_words(
                     "confidence": confidence,
                     "match_type": match_type,
                     "fallback": False,
-                    "source_indices": [item["source_index"]],
+                    "source_indices": [item["source_index"] for item in source_items],
                     "matched": valid_interval is not None,
                     "time_valid": valid_interval is not None,
-                    "timestamp_source": "asr_exact" if match_type == "exact" else "asr_edit",
+                    "timestamp_source": timestamp_source,
                     "invalid_reason": "" if valid_interval is not None else "non_positive_asr_interval",
                 }
             )

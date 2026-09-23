@@ -158,6 +158,28 @@ def selection_score(metric_rows: Iterable[dict[str, Any]]) -> float:
     return float(np.mean(fallback)) if fallback else float("-inf")
 
 
+def classification_priority_score(metric_rows: Iterable[dict[str, Any]]) -> float:
+    """Predeclared V3 development score emphasizing balanced classification.
+
+    Regression metrics remain reported and constrained separately, while this
+    score prevents MAE/Pearson from hiding a collapse of the Neutral class.
+    """
+
+    rows = [dict(row) for row in metric_rows]
+    if not rows:
+        return float("-inf")
+    macro = np.asarray([float(row.get("macro_f1", 0.0)) for row in rows], dtype=np.float64)
+    neutral = np.asarray([float(row.get("f1_neutral", 0.0)) for row in rows], dtype=np.float64)
+    accuracy = np.asarray([float(row.get("accuracy", 0.0)) for row in rows], dtype=np.float64)
+    values = (
+        0.50 * float(np.mean(macro))
+        + 0.20 * float(np.mean(neutral))
+        + 0.15 * float(np.mean(accuracy))
+        + 0.15 * float(np.min(macro))
+    )
+    return float(values)
+
+
 def majority_and_mean_baseline(split: SplitData) -> dict[str, Any]:
     if not split.has_labels or split.size == 0:
         raise ValueError("Baseline requires a non-empty labelled split")

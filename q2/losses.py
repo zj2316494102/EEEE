@@ -19,6 +19,8 @@ def supervised_loss(
     class_weights: Tensor | None = None,
     lambda_regression: float = 1.0,
     lambda_consistency: float = 0.05,
+    neutral_aux_logit: Tensor | None = None,
+    lambda_neutral_aux: float = 0.0,
     label_smoothing: float = 0.0,
     focal_gamma: float = 0.0,
 ) -> tuple[Tensor, dict[str, float]]:
@@ -47,12 +49,23 @@ def supervised_loss(
         )
     huber = F.huber_loss(intensity, regression.float(), delta=1.0)
     consistency = consistency_loss(probabilities, intensity)
-    total = ce + float(lambda_regression) * huber + float(lambda_consistency) * consistency
+    if neutral_aux_logit is not None and float(lambda_neutral_aux) > 0.0:
+        neutral_target = (classification.long() == 1).to(neutral_aux_logit.dtype)
+        neutral_aux = F.binary_cross_entropy_with_logits(neutral_aux_logit, neutral_target)
+    else:
+        neutral_aux = torch.zeros((), device=logits.device, dtype=logits.dtype)
+    total = (
+        ce
+        + float(lambda_regression) * huber
+        + float(lambda_consistency) * consistency
+        + float(lambda_neutral_aux) * neutral_aux
+    )
     return total, {
         "total": float(total.detach().cpu()),
         "cross_entropy": float(ce.detach().cpu()),
         "huber": float(huber.detach().cpu()),
         "consistency": float(consistency.detach().cpu()),
+        "neutral_aux": float(neutral_aux.detach().cpu()),
     }
 
 

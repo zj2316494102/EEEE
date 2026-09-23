@@ -18,7 +18,7 @@ from .checkpoint import (
     restore_rng_state,
 )
 from .data import SplitData
-from .evaluation import evaluate_scenarios, evaluate_split
+from .evaluation import classification_priority_score, evaluate_scenarios, evaluate_split
 from .losses import distillation_loss, supervised_loss
 from .masking import (
     MaskScenario,
@@ -118,26 +118,7 @@ def _validation_rows(
         complete, _ = evaluate_split(model, valid, device=device, batch_size=batch_size)
         complete["scenario"] = "complete"
         rows = [complete]
-    scores = [row.get("composite_score") for row in rows if row.get("composite_score") is not None]
-    if scores:
-        score = float(np.mean(scores))
-    else:
-        # Keep Pearson undefined in persisted metrics, while still making early
-        # stopping deterministic for a temporarily constant regressor.
-        score = float(
-            np.mean(
-                [
-                    (
-                        float(row.get("accuracy", 0.0))
-                        + float(row.get("macro_f1", 0.0))
-                        + 1.0
-                        - float(row.get("mae", 6.0)) / 6.0
-                    )
-                    / 3.0
-                    for row in rows
-                ]
-            )
-        )
+    score = classification_priority_score(rows)
     return rows, score
 
 
@@ -172,6 +153,7 @@ def train_one_model(
     weight_decay = float(training_config.get("weight_decay", 1e-4))
     lambda_regression = float(training_config.get("lambda_regression", 1.0))
     lambda_consistency = float(training_config.get("lambda_consistency", 0.05))
+    lambda_neutral_aux = float(training_config.get("lambda_neutral_aux", 0.0))
     label_smoothing = float(training_config.get("label_smoothing", 0.0))
     focal_gamma = float(training_config.get("focal_gamma", 0.0))
     distill_weight = float(training_config.get("distill_weight", 0.0)) if teacher is not None else 0.0
@@ -179,6 +161,30 @@ def train_one_model(
     distill_regression_weight = float(training_config.get("distill_regression_weight", 0.5))
     augmentation_probability = float(training_config.get("mask_augmentation_probability", 0.75))
     max_fraction = float(training_config.get("mask_max_fraction", 0.60))
+    curriculum_enabled = bool(training_config.get("augmentation_curriculum_enabled", False))
+    curriculum_warmup_epochs = max(0, int(training_config.get("curriculum_warmup_epochs", 10)))
+    curriculum_robust_epochs = max(
+        curriculum_warmup_epochs,
+        int(training_config.get("curriculum_robust_epochs", 30)),
+    )
+    warmup_probability = float(
+        training_config.get("warmup_mask_augmentation_probability", 0.40)
+    )
+    robust_probability = float(
+        training_config.get("robust_mask_augmentation_probability", augmentation_probability)
+    )
+    transfer_probability = float(
+        training_config.get("transfer_mask_augmentation_probability", robust_probability)
+    )
+    warmup_max_fraction = float(
+        training_config.get("warmup_mask_max_fraction", min(max_fraction, 0.30))
+    )
+    robust_max_fraction = float(
+        training_config.get("robust_mask_max_fraction", max_fraction)
+    )
+    transfer_max_fraction = float(
+        training_config.get("transfer_mask_max_fraction", robust_max_fraction)
+    )
     random_point_fraction = float(training_config.get("random_point_fraction", 0.20))
     whole_modality_dropout_probability = float(
         training_config.get("whole_modality_dropout_probability", 0.0)
@@ -207,6 +213,15 @@ def train_one_model(
     runtime_model_config = (
         model.config_dict() if hasattr(model, "config_dict") else dict(model_config)
     )
+
+    def augmentation_settings(epoch: int) -> tuple[str, float, float]:
+        if not use_augmentation or not curriculum_enabled:
+            return "fixed", augmentation_probability, max_fraction
+        if epoch <= curriculum_warmup_epochs:
+            return "warmup", warmup_probability, warmup_max_fraction
+        if epoch <= curriculum_robust_epochs:
+            return "robust", robust_probability, robust_max_fraction
+        return "transfer", transfer_probability, transfer_max_fraction
 
     def save_checkpoint(epoch: int, completed: bool) -> None:
         if checkpoint_file is None:
@@ -282,7 +297,14 @@ def train_one_model(
         model.train()
         total_loss = 0.0
         seen = 0
-        loss_sums = {"cross_entropy": 0.0, "huber": 0.0, "consistency": 0.0, "distillation": 0.0}
+        loss_sums = {
+            "cross_entropy": 0.0,
+            "huber": 0.0,
+            "consistency": 0.0,
+            "neutral_aux": 0.0,
+            "distillation": 0.0,
+        }
+        augmentation_phase, epoch_probability, epoch_max_fraction = augmentation_settings(epoch)
         for batch in loader:
             features = _move_nested(batch["features"], device_obj)
             masks_dict = _move_nested(batch["masks"], device_obj)
@@ -294,15 +316,15 @@ def train_one_model(
                     augmented_numpy = generate_random_point_masks(
                         base_numpy,
                         rng,
-                        probability=augmentation_probability,
+                        probability=epoch_probability,
                         missing_fraction=random_point_fraction,
                     )
                 else:
                     augmented_numpy, _ = generate_contiguous_block_masks(
                         base_numpy,
                         rng,
-                        probability=augmentation_probability,
-                        max_fraction=max_fraction,
+                        probability=epoch_probability,
+                        max_fraction=epoch_max_fraction,
                     )
                 if whole_modality_dropout_probability > 0.0:
                     augmented_numpy = apply_whole_modality_dropout(
@@ -330,6 +352,8 @@ def train_one_model(
                 class_weights=weights,
                 lambda_regression=lambda_regression,
                 lambda_consistency=lambda_consistency,
+                neutral_aux_logit=output.get("neutral_aux_logit"),
+                lambda_neutral_aux=lambda_neutral_aux,
                 label_smoothing=label_smoothing,
                 focal_gamma=focal_gamma,
             )
@@ -354,7 +378,7 @@ def train_one_model(
             count = int(classification.shape[0])
             total_loss += float(loss.detach().cpu()) * count
             seen += count
-            for key in ("cross_entropy", "huber", "consistency"):
+            for key in ("cross_entropy", "huber", "consistency", "neutral_aux"):
                 loss_sums[key] += loss_items[key] * count
             loss_sums["distillation"] += loss_items.get("distillation", 0.0) * count
 
@@ -369,7 +393,11 @@ def train_one_model(
             "train_cross_entropy": loss_sums["cross_entropy"] / max(seen, 1),
             "train_huber": loss_sums["huber"] / max(seen, 1),
             "train_consistency": loss_sums["consistency"] / max(seen, 1),
+            "train_neutral_aux": loss_sums["neutral_aux"] / max(seen, 1),
             "train_distillation": loss_sums["distillation"] / max(seen, 1),
+            "augmentation_phase": augmentation_phase,
+            "augmentation_probability": epoch_probability,
+            "augmentation_max_fraction": epoch_max_fraction,
             "validation_selection_score": score,
             "validation_accuracy": complete.get("accuracy"),
             "validation_macro_f1": complete.get("macro_f1"),

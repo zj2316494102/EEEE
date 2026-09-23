@@ -148,17 +148,34 @@ class ASRAligner:
             device=device_index,
         )
 
-    def extract(self, audio: np.ndarray, duration: float) -> list[dict[str, Any]]:
+    def extract(
+        self,
+        audio: np.ndarray,
+        duration: float,
+        *,
+        num_beams: int = 1,
+        temperature: float = 0.0,
+        context_s: float = 0.0,
+        sample_rate: int = 16000,
+    ) -> list[dict[str, Any]]:
         if audio.size == 0:
             return []
+        context_samples = max(int(round(float(context_s) * int(sample_rate))), 0)
+        if context_samples:
+            model_audio = np.pad(audio, (context_samples, context_samples), mode="constant")
+            timestamp_shift = float(context_samples) / max(int(sample_rate), 1)
+        else:
+            model_audio = audio
+            timestamp_shift = 0.0
         result = self.pipeline(
-            audio,
+            model_audio,
             return_timestamps="word",
             generate_kwargs={
                 "language": "english",
                 "task": "transcribe",
-                "temperature": 0.0,
-                "num_beams": 1,
+                "temperature": float(temperature),
+                "num_beams": int(num_beams),
+                "do_sample": bool(float(temperature) > 0.0),
             },
         )
         words: list[dict[str, Any]] = []
@@ -166,8 +183,12 @@ class ASRAligner:
             timestamp = chunk.get("timestamp")
             if not timestamp or timestamp[0] is None:
                 continue
-            start = float(timestamp[0])
-            end = float(timestamp[1]) if timestamp[1] is not None else min(duration, start + 0.05)
+            start = float(timestamp[0]) - timestamp_shift
+            end = (
+                float(timestamp[1]) - timestamp_shift
+                if timestamp[1] is not None
+                else min(float(duration), start + 0.05)
+            )
             if end <= start:
                 end = min(duration, start + 0.05)
             if end <= 0 or start >= duration:

@@ -114,6 +114,16 @@ class RobustGatedTemporalFusion(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(projection_dim // 2, 3),
         )
+        # Auxiliary Neutral/Non-neutral supervision.  The final prediction
+        # remains the direct three-class head; this auxiliary head never
+        # replaces the class probabilities.
+        self.neutral_aux_head = nn.Sequential(
+            nn.LayerNorm(head_input_dim),
+            nn.Linear(head_input_dim, projection_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(projection_dim // 2, 1),
+        )
         self.regression_head = nn.Sequential(
             nn.LayerNorm(head_input_dim),
             nn.Linear(head_input_dim, projection_dim // 2),
@@ -234,11 +244,13 @@ class RobustGatedTemporalFusion(nn.Module):
         if self.use_coverage_features:
             head_input = torch.cat([head_input, coverage, longest_missing], dim=-1)
         logits = self.classification_head(head_input)
+        neutral_aux_logit = self.neutral_aux_head(head_input).squeeze(-1)
         intensity = 3.0 * torch.tanh(self.regression_head(head_input).squeeze(-1))
         return {
             "logits": logits,
             "probabilities": torch.softmax(logits, dim=-1),
             "intensity": intensity,
+            "neutral_aux_logit": neutral_aux_logit,
             "representation": pooled,
             "gate_weights": weights,
             "coverage": coverage,

@@ -17,10 +17,16 @@ text_output_hidden_states: true
 text_token_pooling: word_mean_subtokens
 text_hidden_size: 768
 text_max_length: 8192
-text_match_max_edit_ratio: 0.34
+text_alignment_strategy: monotonic_dp_v1
+text_match_max_edit_ratio: 0.40
 text_fallback_confidence: 0.20
 text_fallback_min_interval_s: 0.01
 text_low_confidence_threshold: 0.50
+asr_retry_enabled: true
+asr_retry_min_fallback_ratio: 0.50
+asr_retry_num_beams: 3
+asr_retry_temperature: 0.20
+asr_retry_context_s: 0.50
 
 asr_timestamp_model: openai/whisper-large-v3-turbo
 asr_timestamp_model_path: models/openai--whisper-large-v3-turbo

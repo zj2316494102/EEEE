@@ -29,6 +29,7 @@ from .data import (
 )
 from .evaluation import (
     aggregate_scenario_metrics,
+    classification_priority_score,
     evaluate_scenarios,
     evaluate_split,
     majority_and_mean_baseline,
@@ -204,7 +205,7 @@ def _seed_summary_row(result: TrainingResult, validation_rows: list[dict[str, An
         "seed": result.seed,
         "best_epoch": result.best_epoch,
         "best_training_selection_score": result.best_score,
-        "validation_selection_score": aggregate_scenario_metrics(validation_rows).get("mean_composite_score"),
+        "validation_selection_score": classification_priority_score(validation_rows),
         "validation_accuracy": complete.get("accuracy"),
         "validation_macro_f1": complete.get("macro_f1"),
         "validation_weighted_f1": complete.get("weighted_f1"),
@@ -562,7 +563,14 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             trained.append((result, rows))
         if not trained:
             raise RuntimeError("No model was trained")
-        selected_index = int(np.argmax([aggregate_scenario_metrics(rows).get("mean_composite_score") or result.best_score for result, rows in trained]))
+        selected_index = int(
+            np.argmax(
+                [
+                    classification_priority_score(rows) if rows else result.best_score
+                    for result, rows in trained
+                ]
+            )
+        )
         selected_result, selected_selection_rows = trained[selected_index]
         selected_seed = selected_result.seed
         LOGGER.info("Selected seed %s with validation score %.6f", selected_seed, selected_result.best_score)
@@ -667,6 +675,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             "dataset_metadata": bundle.metadata,
             "sample_counts": {"train": train.size, "valid": valid.size, "test": test.size},
             "selected_validation_summary": aggregate_scenario_metrics(validation_rows),
+            "selected_classification_priority_score": classification_priority_score(validation_rows),
             "test_metrics_file": str(validation_dir / "test_metrics.json"),
             "model_file": str(model_path),
             "model_file_sha256": sha256_file(model_path),
