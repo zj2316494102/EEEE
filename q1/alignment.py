@@ -68,13 +68,31 @@ def _similar_enough(left: str, right: str, max_ratio: float) -> bool:
 
 
 def _clip_interval(start: float, end: float, duration: float) -> tuple[float, float]:
-    start = float(np.clip(start, 0.0, max(duration, 0.0)))
-    end = float(np.clip(end, 0.0, max(duration, 0.0)))
+    duration = max(float(duration), 0.0)
+    start = float(np.clip(start, 0.0, duration))
+    end = float(np.clip(end, 0.0, duration))
     if end < start:
         start, end = end, start
-    if duration > 0 and end <= start:
-        end = min(duration, start + 1e-6)
     return start, end
+
+
+def _float32_interval(
+    start: float,
+    end: float,
+    duration: float,
+    minimum_duration: float = 0.0,
+) -> tuple[float, float] | None:
+    """Validate an interval after the precision used by persisted audit data."""
+    start32 = float(np.float32(start))
+    end32 = float(np.float32(end))
+    duration32 = float(np.float32(max(duration, 0.0)))
+    if not (np.isfinite(start32) and np.isfinite(end32)):
+        return None
+    if start32 < 0.0 or end32 > duration32 or end32 <= start32:
+        return None
+    if end32 - start32 < float(minimum_duration):
+        return None
+    return start32, end32
 
 
 def _fallback_interval(
@@ -82,9 +100,16 @@ def _fallback_interval(
     unmatched_indices: list[int],
     records: list[dict[str, Any]],
     duration: float,
-) -> tuple[float, float]:
-    previous = next((records[i] for i in range(target_index - 1, -1, -1) if records[i].get("matched")), None)
-    following = next((records[i] for i in range(target_index + 1, len(records)) if records[i].get("matched")), None)
+    minimum_duration: float,
+) -> tuple[float, float] | None:
+    previous = next(
+        (records[i] for i in range(target_index - 1, -1, -1) if records[i].get("matched") and records[i].get("time_valid")),
+        None,
+    )
+    following = next(
+        (records[i] for i in range(target_index + 1, len(records)) if records[i].get("matched") and records[i].get("time_valid")),
+        None,
+    )
     group_position = unmatched_indices.index(target_index)
     group_size = len(unmatched_indices)
     if previous and following:
@@ -102,7 +127,8 @@ def _fallback_interval(
         right = left
     start = left + (right - left) * group_position / group_size
     end = left + (right - left) * (group_position + 1) / group_size
-    return _clip_interval(start, end, duration)
+    start, end = _clip_interval(start, end, duration)
+    return _float32_interval(start, end, duration, minimum_duration=minimum_duration)
 
 
 def align_text_words(
@@ -111,6 +137,7 @@ def align_text_words(
     duration: float,
     max_edit_ratio: float = 0.34,
     fallback_confidence: float = 0.20,
+    fallback_min_interval_s: float = 0.01,
 ) -> list[dict[str, Any]]:
     """Align provided-text tokens to ASR timestamps without replacing the text.
 
@@ -159,6 +186,9 @@ def align_text_words(
             "fallback": True,
             "source_indices": [],
             "matched": False,
+            "time_valid": False,
+            "timestamp_source": "unassigned",
+            "invalid_reason": "not_aligned",
         }
         for item in target
     ]
@@ -194,21 +224,54 @@ def align_text_words(
                 confidence = max(confidence, 0.90)
             else:
                 confidence = min(confidence, 0.65)
+            valid_interval = _float32_interval(item["start"], item["end"], duration)
             current.update(
                 {
-                    "start": item["start"],
-                    "end": item["end"],
+                    "start": valid_interval[0] if valid_interval is not None else None,
+                    "end": valid_interval[1] if valid_interval is not None else None,
                     "confidence": confidence,
                     "match_type": match_type,
                     "fallback": False,
                     "source_indices": [item["source_index"]],
-                    "matched": True,
+                    "matched": valid_interval is not None,
+                    "time_valid": valid_interval is not None,
+                    "timestamp_source": "asr_exact" if match_type == "exact" else "asr_edit",
+                    "invalid_reason": "" if valid_interval is not None else "non_positive_asr_interval",
                 }
             )
 
     unmatched = [index for index, record in enumerate(records) if not record["matched"]]
     for index in unmatched:
-        start, end = _fallback_interval(index, unmatched, records, duration)
+        fallback = _fallback_interval(index, unmatched, records, duration, float(fallback_min_interval_s))
+        if fallback is None:
+            records[index].update(
+                {
+                    "start": None,
+                    "end": None,
+                    "confidence": fallback_confidence,
+                    "match_type": "invalid_fallback",
+                    "fallback": True,
+                    "time_valid": False,
+                    "timestamp_source": "invalid",
+                    "invalid_reason": "fallback_interval_below_0.01s_or_float32_collapse",
+                }
+            )
+            continue
+        start, end = fallback
+        if end - start < float(fallback_min_interval_s):
+            records[index].update(
+                {
+                    "start": None,
+                    "end": None,
+                    "confidence": fallback_confidence,
+                    "match_type": "invalid_fallback",
+                    "fallback": True,
+                    "time_valid": False,
+                    "timestamp_source": "invalid",
+                    "invalid_reason": "fallback_interval_below_configured_minimum",
+                }
+            )
+            continue
         records[index].update(
             {
                 "start": start,
@@ -216,8 +279,26 @@ def align_text_words(
                 "confidence": fallback_confidence,
                 "match_type": "boundary_or_uniform_fallback",
                 "fallback": True,
+                "time_valid": True,
+                "timestamp_source": "fallback_boundary_or_uniform",
+                "invalid_reason": "",
             }
         )
+    for record in records:
+        if record.get("time_valid") and record.get("start") is not None and record.get("end") is not None:
+            persisted_interval = _float32_interval(record["start"], record["end"], duration)
+            if persisted_interval is None:
+                record.update(
+                    {
+                        "start": None,
+                        "end": None,
+                        "time_valid": False,
+                        "timestamp_source": "invalid",
+                        "invalid_reason": "float32_persistence_collapse",
+                    }
+                )
+            else:
+                record["start"], record["end"] = persisted_interval
     for record in records:
         record.pop("matched", None)
     return records
@@ -318,4 +399,3 @@ def standardize_aligned(
     standardized[~masks] = 0.0
     standardized = np.nan_to_num(standardized, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     return standardized, mean, std, valid.reshape(masks.shape)
-

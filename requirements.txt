@@ -1,5 +1,7 @@
-# Install torch from the CUDA 12.1 wheel index on the RTX 3090 host:
+# Unified dependencies for Q1 and Q2.
+# Install the CUDA 12.1 PyTorch wheel separately on the RTX 3090 host:
 # python -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121
+
 transformers==4.48.3
 accelerate==1.2.1
 huggingface_hub==0.27.1

@@ -1,0 +1,54 @@
+# Question 2: aligned_50 multimodal robust prediction.
+feature_version: aligned_50
+max_length: 50
+input_dims: [768, 74, 35]
+aligned_feature_path: E题数据/附件2-数据集特征文件/aligned_50.pkl
+label_path: E题数据/附件2-数据集特征文件/label.xlsx
+attachment3_aligned_dir: E题数据/附件3-模态缺失特征样本/对齐版本
+run_root: runs
+
+# Dynamic-gated temporal fusion model.
+projection_dim: 128
+transformer_layers: 2
+attention_heads: 4
+feedforward_dim: 256
+dropout: 0.15
+use_mask_input: true
+fusion: dynamic
+use_transformer: true
+use_coverage_features: true
+
+# Training.
+optimizer: AdamW
+learning_rate: 0.0003
+weight_decay: 0.0001
+batch_size: 64
+max_epochs: 100
+early_stopping_patience: 12
+lambda_regression: 1.0
+lambda_consistency: 0.05
+gradient_clip_norm: 1.0
+num_workers: 0
+use_class_weights: true
+mask_augmentation_probability: 0.75
+mask_max_fraction: 0.60
+random_point_fraction: 0.20
+
+# Teacher/student is an explicitly optional candidate. It is disabled until
+# the same fixed validation matrix demonstrates a stable gain.
+distillation_enabled: false
+distill_weight: 0.20
+distill_temperature: 2.0
+distill_regression_weight: 0.5
+
+random_seeds: [2026, 42, 3407]
+selection_missing_fractions: [0.20]
+selection_missing_positions: [middle]
+selection_missing_groups: [[0], [1], [2], [0, 1, 2]]
+selection_relation_modes: [overlap]
+validation_missing_fractions: [0.10, 0.20, 0.40, 0.60]
+validation_missing_positions: [front, middle, back]
+validation_missing_groups: [[0], [1], [2], [0, 1], [0, 2], [1, 2], [0, 1, 2]]
+validation_relation_modes: [overlap, stagger]
+validation_mask_seeds: [2026, 42, 3407]
+

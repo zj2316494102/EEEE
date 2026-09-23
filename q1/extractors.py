@@ -312,7 +312,15 @@ class VisionExtractor:
 
     def extract(self, video_path: Path, duration: float) -> VisionFeatures:
         frames = self._decode_frames(video_path)
+        decoded_frame_count = len(frames)
+        decoded_indices = np.arange(decoded_frame_count, dtype=np.int32)
+        decoded_centers = (decoded_indices.astype(np.float64) + 0.5) / self.output_fps
+        decoded_spans = frame_spans_from_centers(decoded_centers, duration, self.output_fps)
+        retained = (decoded_centers < float(duration)) & (decoded_spans[:, 1] > decoded_spans[:, 0])
+        retained_indices = decoded_indices[retained]
+        frames = [frame for frame, keep in zip(frames, retained.tolist()) if keep]
         frame_count = len(frames)
+        discarded_frame_count = decoded_frame_count - frame_count
         if frame_count == 0:
             return VisionFeatures(
                 np.zeros((0, 768), dtype=np.float32),
@@ -324,7 +332,13 @@ class VisionExtractor:
                 np.zeros(0, dtype=np.float32),
                 np.zeros(0, dtype=np.int32),
                 0,
-                {"decoded_frames": 0, "face_frames": 0, "track_switches": 0},
+                {
+                    "decoded_frames": decoded_frame_count,
+                    "retained_frames": 0,
+                    "discarded_out_of_timeline_frames": discarded_frame_count,
+                    "face_frames": 0,
+                    "track_switches": 0,
+                },
             )
         detections = self._detect(frames)
         track = self._select_track(detections)
@@ -368,7 +382,7 @@ class VisionExtractor:
                     features[frame_index] = hidden[offset]
                     emotion_probs[frame_index] = probs[offset]
                     mask[frame_index] = 1
-        centers = (np.arange(frame_count, dtype=np.float64) + 0.5) / self.output_fps
+        centers = (retained_indices.astype(np.float64) + 0.5) / self.output_fps
         spans = frame_spans_from_centers(centers, duration, self.output_fps)
         face_frames = int(mask.sum())
         return VisionFeatures(
@@ -380,10 +394,12 @@ class VisionExtractor:
             face_bbox,
             face_confidence,
             track_ids,
-            np.arange(frame_count, dtype=np.int32),
+            retained_indices,
             frame_count,
             {
-                "decoded_frames": frame_count,
+                "decoded_frames": decoded_frame_count,
+                "retained_frames": frame_count,
+                "discarded_out_of_timeline_frames": discarded_frame_count,
                 "face_frames": face_frames,
                 "face_detection_ratio": face_frames / max(frame_count, 1),
                 "track_switches": 0,

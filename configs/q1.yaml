@@ -1,11 +1,13 @@
 model_profile: uniform_768_reproducible
 model_manifest: models/model_manifest.json
 models_root: models
-run_root: runs
+results_root: results/问题1
+run_root: results/问题1
 
 data_root: E题数据
 video_root: E题数据/附件1-数据集原始多模态样本/MOSEI数据集部分原始视频-100条
 label_file: E题数据/附件1-数据集原始多模态样本/MOSEI数据集部分原始视频-100条/label-100.xlsx
+source_duration_range_s: [2.648, 34.567]
 
 text_model: answerdotai/ModernBERT-base
 text_model_path: models/answerdotai--ModernBERT-base
@@ -17,6 +19,8 @@ text_hidden_size: 768
 text_max_length: 8192
 text_match_max_edit_ratio: 0.34
 text_fallback_confidence: 0.20
+text_fallback_min_interval_s: 0.01
+text_low_confidence_threshold: 0.50
 
 asr_timestamp_model: openai/whisper-large-v3-turbo
 asr_timestamp_model_path: models/openai--whisper-large-v3-turbo
@@ -51,6 +55,7 @@ face_detector_min_confidence: 0.5
 face_crop_margin: 0.20
 face_track_iou_threshold: 0.20
 face_track_max_gap_frames: 2
+vision_degraded_threshold: 0.50
 video_decoder: ffmpeg
 video_decoder_version: ffmpeg 7.1.1
 video_timestamp_source: explicit_25fps_resampling
@@ -75,4 +80,8 @@ transformers_version: 4.48.3
 opencv_version: 4.11.0
 save_unaligned: true
 generate_typical_sample_figure: true
+audit_sample_ids:
+  - -t217m2on-s$_$7
+  - -NFrJFQijFE$_$1
+  - -yRb-Jum7EQ$_$1
 require_all_samples_complete: true

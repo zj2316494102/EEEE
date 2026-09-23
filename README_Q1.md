@@ -11,36 +11,36 @@ source /usr/local/iCompute/etc/profile.d/conda.sh
 conda activate eeeeee
 conda install -y -c conda-forge ffmpeg=7.1
 python -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121
-python -m pip install -r requirements-q1.txt
+python -m pip install -r requirements.txt
 ```
 
-安装后记录：
+安装后记录（正式运行会自动写入每个 run 的 `environment/`）：
 
 ```bash
-python -m pip freeze > runs/environment-pip-freeze.txt
+python -m pip freeze > results/问题1/environment-pip-freeze.txt
 ffmpeg -version | head -n 1
 nvidia-smi
 ```
 
 ## 运行
 
-代码和配置同步到 `/home/user/EEEEEE` 后执行：
+代码和配置同步到 `/home/user/EEEEEE` 后执行。运行结果统一写入 `results/问题1/<run_id>/`：
 
 ```bash
 source /usr/local/iCompute/etc/profile.d/conda.sh
 conda activate eeeeee
 cd /home/user/EEEEEE
 tmux new -s eeeeee-q1
-bash tools/run_q1.sh --run-id 20260923_q1_001 --config configs/q1.yaml
+python -m q1.pipeline --run-id 20260923_q1_001 --config configs/q1.yaml
 ```
 
 试运行可以使用：
 
 ```bash
-bash tools/run_q1.sh --run-id 20260923_q1_smoke --limit 1 --allow-failures --skip-model-hash
+python -m q1.pipeline --run-id 20260923_q1_smoke --limit 1 --allow-failures --skip-model-hash
 ```
 
-运行完成后，只有出现 `runs/<run_id>/DONE` 才下载结果。结果包括 `outputs/q1_submission/` 和 `outputs/q1_audit/`。
+运行完成后，只有出现 `results/问题1/<run_id>/DONE` 才下载结果。结果包括 `outputs/q1_submission/` 和 `outputs/q1_audit/`。
 
 ## 输出接口
 
@@ -57,9 +57,10 @@ vision [N, 50, 768] float16
 ## 验证
 
 ```bash
-bash tools/validate_q1.sh \
-  --artifact runs/20260923_q1_001/outputs/q1_submission/q1_aligned_50.pkl \
-  --manifest runs/20260923_q1_001/outputs/q1_submission/manifest.csv \
+python -m q1.validate \
+  --artifact results/问题1/20260923_q1_001/outputs/q1_submission/q1_aligned_50.pkl \
+  --manifest results/问题1/20260923_q1_001/outputs/q1_submission/manifest.csv \
+  --raw-audit results/问题1/20260923_q1_001/outputs/q1_audit/q1_unaligned.pkl \
   --expected-count 100
 ```
 

@@ -34,12 +34,12 @@ __pycache__/
 docs/
 models/
 tools/
-scripts/
 tests/
 
 # Local datasets and experiment results
 E题数据/
 results/
+runs/
 *.pkl
 
 # Downloaded model weights and caches; model metadata remains tracked

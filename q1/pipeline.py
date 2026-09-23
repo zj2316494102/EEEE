@@ -123,11 +123,35 @@ def build_manifest(config: Q1Config, logger: logging.Logger) -> list[dict[str, A
         media = probe_media(video_path)
         if media["duration"] <= 0:
             raise ValueError(f"Invalid video duration for {video_path}")
+        source_duration_range = config.get("source_duration_range_s", [0.0, float("inf")])
+        container_duration = float(media["duration_container"])
+        if not (float(source_duration_range[0]) - 1e-4 <= container_duration <= float(source_duration_range[1]) + 1e-4):
+            raise ValueError(
+                f"Container duration {container_duration:.6f}s outside configured source range "
+                f"{source_duration_range} for {video_path}"
+            )
         record = {
             **label,
             "video_path": str(video_path),
             "video_path_relative": str(video_path.relative_to(config.project_root)),
-            "duration": float(media["duration"]),
+            "duration": float(media["duration_alignment"]),  # internal compatibility alias
+            "duration_container": float(media["duration_container"]),
+            "duration_format": float(media["duration_format"]),
+            "duration_mvhd": float(media["duration_mvhd"]),
+            "duration_video_stream": float(media["duration_video_stream"]),
+            "duration_audio_stream": float(media["duration_audio_stream"]),
+            "duration_video_edit": float(media["duration_video_edit"]),
+            "duration_audio_edit": float(media["duration_audio_edit"]),
+            "duration_decoded_video": float(media["duration_decoded_video"]),
+            "duration_decoded_audio": float(media["duration_decoded_audio"]),
+            "duration_decoded": float(media["duration_decoded"]),
+            "duration_alignment": float(media["duration_alignment"]),
+            "duration_source": str(media["duration_source"]),
+            "duration_start_time": float(media["duration_start_time"]),
+            "video_edit_list_entries": int(media["video_edit_list_entries"]),
+            "audio_edit_list_entries": int(media["audio_edit_list_entries"]),
+            "video_edit_list_present": int(media["video_edit_list_present"]),
+            "audio_edit_list_present": int(media["audio_edit_list_present"]),
             "video_fps": float(media["video_fps"]),
             "video_width": int(media["video_width"]),
             "video_height": int(media["video_height"]),
@@ -155,23 +179,40 @@ def _empty_result(config: Q1Config, entry: dict[str, Any], reason: str) -> dict[
         "audio": np.zeros((length, audio_dim), dtype=np.float32),
         "vision": np.zeros((length, vision_dim), dtype=np.float32),
         "text_mask": np.zeros(length, dtype=np.uint8),
+        "text_confidence": np.zeros(length, dtype=np.float32),
+        "text_low_confidence_mask": np.zeros(length, dtype=np.uint8),
         "audio_mask": np.zeros(length, dtype=np.uint8),
         "vision_mask": np.zeros(length, dtype=np.uint8),
         "vision_emotion_probs": np.zeros((length, 7), dtype=np.float32),
         "audio_prosody": np.zeros((length, 5), dtype=np.float32),
         "audio_prosody_mask": np.zeros(length, dtype=np.uint8),
-        "duration": float(entry["duration"]),
-        "time_grid": make_time_grid(float(entry["duration"]), length),
+        "duration": float(entry["duration_alignment"]),
+        "duration_container": float(entry["duration_container"]),
+        "duration_alignment": float(entry["duration_alignment"]),
+        "time_grid": make_time_grid(float(entry["duration_alignment"]), length),
         "raw_lengths": {"text": 0, "audio": 0, "vision": 0},
         "valid_lengths": {"text": 0, "audio": 0, "vision": 0},
         "stats": {
             "text_valid_ratio": 0.0,
+            "text_low_confidence_ratio": 0.0,
+            "text_fallback_count": 0,
+            "text_fallback_ratio": 0.0,
+            "text_lexical_asr_word_count": 0,
+            "text_review_status": "processing_failed_manual_review",
             "audio_valid_ratio": 0.0,
             "vision_valid_ratio": 0.0,
+            "vision_face_detection_ratio": 0.0,
+            "vision_imputed_ratio": 0.0,
             "failure_reason": reason,
         },
         "raw_audit": {"id": entry["id"], "error": reason},
         "status": "failed",
+        "processing_status": "failed",
+        "quality_status": "missing",
+        "modality_status": {"text": "missing", "audio": "missing", "vision": "missing"},
+        "modality_failure_reasons": {"text": reason, "audio": reason, "vision": reason},
+        "vision_status": "missing",
+        "vision_failure_reason": reason,
         "failure_reason": reason,
     }
 
@@ -184,9 +225,10 @@ def process_sample(
     audio_extractor: AudioExtractor,
     vision_extractor: VisionExtractor,
 ) -> dict[str, Any]:
-    duration = float(entry["duration"])
+    duration = float(entry["duration_alignment"])
     grid = make_time_grid(duration, config.aligned_length)
-    audio = extract_audio(Path(entry["video_path"]), int(config.get("audio_sample_rate", 16000)))
+    sample_rate = int(config.get("audio_sample_rate", 16000))
+    audio = extract_audio(Path(entry["video_path"]), sample_rate)
     asr_words = asr_aligner.extract(audio, duration)
     text_raw = text_extractor.extract(entry["raw_text"])
     aligned_words = align_text_words(
@@ -195,15 +237,35 @@ def process_sample(
         duration,
         max_edit_ratio=float(config.get("text_match_max_edit_ratio", 0.34)),
         fallback_confidence=float(config.get("text_fallback_confidence", 0.20)),
+        fallback_min_interval_s=float(config.get("text_fallback_min_interval_s", 0.01)),
     )
+    valid_text_positions = [
+        position
+        for position, index in enumerate(text_raw.word_indices)
+        if aligned_words[index].get("time_valid")
+        and aligned_words[index].get("start") is not None
+        and aligned_words[index].get("end") is not None
+    ]
+    valid_text_indices = [text_raw.word_indices[position] for position in valid_text_positions]
+    text_features = text_raw.features[valid_text_positions] if valid_text_positions else np.zeros((0, 768), dtype=np.float32)
     text_spans = np.asarray(
-        [[aligned_words[index]["start"], aligned_words[index]["end"]] for index in text_raw.word_indices],
+        [[aligned_words[index]["start"], aligned_words[index]["end"]] for index in valid_text_indices],
         dtype=np.float64,
     ).reshape((-1, 2))
-    text_quality = np.asarray([aligned_words[index]["confidence"] for index in text_raw.word_indices], dtype=np.float64)
-    text_aligned, text_mask, text_weights = overlap_pool(
-        text_raw.features, text_spans, grid, quality=text_quality
-    )
+    text_quality = np.asarray([aligned_words[index]["confidence"] for index in valid_text_indices], dtype=np.float64)
+    text_aligned, text_mask, text_weights = overlap_pool(text_features, text_spans, grid, quality=text_quality)
+    if len(text_features):
+        text_confidence_aligned, _, _ = overlap_pool(
+            text_quality[:, None].astype(np.float32), text_spans, grid, valid_mask=np.ones(len(text_features), dtype=bool)
+        )
+        text_confidence_aligned = text_confidence_aligned[:, 0]
+    else:
+        text_confidence_aligned = np.zeros(config.aligned_length, dtype=np.float32)
+    text_confidence_aligned = np.clip(text_confidence_aligned, 0.0, 1.0).astype(np.float32)
+    text_low_confidence_mask = (
+        (text_mask.astype(bool))
+        & (text_confidence_aligned < float(config.get("text_low_confidence_threshold", 0.50)))
+    ).astype(np.uint8)
 
     audio_raw = audio_extractor.extract(audio, duration)
     audio_aligned, audio_mask, audio_weights = overlap_pool(
@@ -238,6 +300,42 @@ def process_sample(
     )
     vision_mask = np.minimum(vision_mask, emotion_mask).astype(np.uint8)
 
+    text_fallback_count = int(sum(bool(item.get("fallback")) for item in aligned_words))
+    text_invalid_timestamp_count = int(sum(not bool(item.get("time_valid")) for item in aligned_words))
+    text_fallback_ratio = text_fallback_count / max(len(aligned_words), 1)
+    text_low_confidence_ratio = float(text_low_confidence_mask.mean())
+    vision_valid_ratio = float(vision_mask.mean())
+    vision_face_detection_ratio = float(vision_raw.detector_stats.get("face_detection_ratio", 0.0))
+    vision_threshold = float(config.get("vision_degraded_threshold", 0.50))
+    if vision_valid_ratio <= 0.0:
+        vision_status, vision_failure_reason = "missing", "no_face_detected"
+    elif vision_valid_ratio < vision_threshold:
+        vision_status, vision_failure_reason = "degraded", "low_face_coverage"
+    else:
+        vision_status, vision_failure_reason = "ok", ""
+    text_status = "missing" if not text_mask.any() else ("degraded" if text_low_confidence_mask.any() else "ok")
+    audio_status = "missing" if not audio_mask.any() else "ok"
+    modality_status = {"text": text_status, "audio": audio_status, "vision": vision_status}
+    status_severity = {"ok": 0, "degraded": 1, "missing": 2}
+    quality_status = max(modality_status.values(), key=lambda item: status_severity[item])
+    source_counts: dict[str, int] = {}
+    for item in aligned_words:
+        source = str(item.get("timestamp_source", "unknown"))
+        source_counts[source] = source_counts.get(source, 0) + 1
+    text_timestamp_source = ";".join(f"{key}:{source_counts[key]}" for key in sorted(source_counts))
+    lexical_asr_count = sum(bool(re.search(r"[A-Za-z0-9]", str(item.get("text", "")))) for item in asr_words)
+    if text_fallback_ratio >= 0.999999:
+        if lexical_asr_count == 0:
+            text_review_status = "asr_empty_or_nonlexical_manual_review"
+        else:
+            text_review_status = "asr_text_mismatch_manual_review"
+    elif text_fallback_ratio >= 0.50:
+        text_review_status = "high_fallback_manual_review"
+    elif text_invalid_timestamp_count:
+        text_review_status = "partial_invalid_timestamp_manual_review"
+    else:
+        text_review_status = "normal"
+
     valid_lengths = {
         "text": int(text_mask.sum()),
         "audio": int(audio_mask.sum()),
@@ -245,17 +343,27 @@ def process_sample(
     }
     stats = {
         "text_valid_ratio": float(text_mask.mean()),
+        "text_low_confidence_ratio": text_low_confidence_ratio,
         "audio_valid_ratio": float(audio_mask.mean()),
-        "vision_valid_ratio": float(vision_mask.mean()),
+        "vision_valid_ratio": vision_valid_ratio,
         "text_word_count": len(aligned_words),
         "text_asr_word_count": len(asr_words),
         "text_exact_match_count": sum(item["match_type"] == "exact" for item in aligned_words),
         "text_edit_match_count": sum(item["match_type"] == "edit_distance" for item in aligned_words),
-        "text_fallback_count": sum(item["fallback"] for item in aligned_words),
+        "text_fallback_count": text_fallback_count,
+        "text_fallback_ratio": text_fallback_ratio,
+        "text_invalid_timestamp_count": text_invalid_timestamp_count,
+        "text_timestamp_source": text_timestamp_source,
+        "text_lexical_asr_word_count": lexical_asr_count,
+        "text_review_status": text_review_status,
         "audio_raw_frame_count": int(len(audio_raw.features)),
+        "audio_decoded_duration": float(len(audio) / max(sample_rate, 1)),
         "vision_raw_frame_count": int(vision_raw.frame_count),
+        "vision_decoded_frame_count": int(vision_raw.detector_stats.get("decoded_frames", vision_raw.frame_count)),
+        "vision_discarded_out_of_timeline_frames": int(vision_raw.detector_stats.get("discarded_out_of_timeline_frames", 0)),
         "vision_face_frame_count": int(vision_raw.detector_stats["face_frames"]),
-        "vision_face_detection_ratio": float(vision_raw.detector_stats["face_detection_ratio"]),
+        "vision_face_detection_ratio": vision_face_detection_ratio,
+        "vision_imputed_ratio": 0.0,
         "vision_track_switches": int(vision_raw.detector_stats["track_switches"]),
         "text_weight_sum": float(text_weights.sum()),
         "audio_weight_sum": float(audio_weights.sum()),
@@ -266,9 +374,11 @@ def process_sample(
     raw_audit = {
         "id": entry["id"],
         "text": {
-            "features": text_raw.features.astype(np.float16),
+            "features": text_features.astype(np.float16),
             "spans": text_spans.astype(np.float32),
             "words": aligned_words,
+            "word_indices": valid_text_indices,
+            "invalid_word_indices": [index for index, item in enumerate(aligned_words) if not item.get("time_valid")],
             "asr_words": asr_words,
             "overflow_chunks": text_raw.overflow_chunks,
         },
@@ -297,18 +407,32 @@ def process_sample(
         "audio": audio_aligned,
         "vision": vision_aligned,
         "text_mask": text_mask,
+        "text_confidence": text_confidence_aligned,
+        "text_low_confidence_mask": text_low_confidence_mask,
         "audio_mask": audio_mask,
         "vision_mask": vision_mask,
         "vision_emotion_probs": emotion_aligned,
         "audio_prosody": prosody_aligned,
         "audio_prosody_mask": prosody_mask,
         "duration": duration,
+        "duration_container": float(entry["duration_container"]),
+        "duration_alignment": duration,
         "time_grid": grid,
-        "raw_lengths": {"text": int(len(text_raw.features)), "audio": int(len(audio_raw.features)), "vision": int(vision_raw.frame_count)},
+        "raw_lengths": {"text": int(len(text_features)), "audio": int(len(audio_raw.features)), "vision": int(vision_raw.frame_count)},
         "valid_lengths": valid_lengths,
         "stats": stats,
         "raw_audit": raw_audit,
         "status": "complete",
+        "processing_status": "complete",
+        "quality_status": quality_status,
+        "modality_status": modality_status,
+        "modality_failure_reasons": {
+            "text": "low_confidence_or_asr_mismatch" if text_status == "degraded" else "",
+            "audio": "no_valid_audio_frames" if audio_status == "missing" else "",
+            "vision": vision_failure_reason,
+        },
+        "vision_status": vision_status,
+        "vision_failure_reason": vision_failure_reason,
         "failure_reason": "",
     }
 
@@ -356,7 +480,7 @@ vision [N, 50, 768]
 
 The Question 2 and Question 3 models must continue to use attachment 2's `768/74/35` interface. This artifact is not a replacement for attachment 2.
 
-The provided transcript is retained as `raw_text`. Whisper word timestamps are used only to locate the provided words in time. The 50 bins are proportional half-open intervals over each clip duration, and each feature is pooled by temporal overlap and quality weight. Invalid bins are zero after standardization and have mask value 0.
+The provided transcript is retained as `raw_text`. Whisper word timestamps are used only to locate the provided words in time. The 50 bins are proportional half-open intervals over `duration_alignment`, which follows the edit-list-aware FFmpeg presentation timeline. The source container/movie-header (`mvhd`) duration is retained separately as `duration_container` for auditing. Each feature is pooled by temporal overlap and quality weight. Invalid bins are zero after standardization and have mask value 0.
 
 Run ID: `{run_id}`  
 Config hash: `{config.config_hash}`  
@@ -367,8 +491,12 @@ Files:
 - `q1_aligned_50.pkl`: submission candidate with aligned features, masks, lengths, timestamps and metadata.
 - `manifest.csv`: one row per source sample.
 - `alignment_log.csv`: extraction, alignment and quality statistics.
+- `duration_audit.csv`: container, stream, decoded and selected alignment durations.
+- `text_review.csv`: per-sample ASR lexical coverage, fallback ratio and manual-review status.
 - `normalization.json`: per-modality z-score parameters computed from valid Question 1 bins.
 - `config.yaml`: resolved configuration and runtime versions.
+
+`processing_status` describes whether extraction completed. `quality_status` and `vision_status` separately identify degraded or missing modalities. Text fallback words remain traceable in the audit files and are represented by `text_confidence` and `text_low_confidence_mask`.
 
 The local audit directory contains unaligned sequences, raw timestamps, face tracks and detailed logs. It is intentionally excluded from the submission archive.
 """
@@ -511,7 +639,11 @@ def run_pipeline(
                 "audio": audio_masks.astype(np.uint8),
                 "vision": vision_masks.astype(np.uint8),
             },
+            "text_confidence": np.stack([item["text_confidence"] for item in results]).astype(np.float32),
+            "text_low_confidence_mask": np.stack([item["text_low_confidence_mask"] for item in results]).astype(np.uint8),
             "durations": np.asarray([item["duration"] for item in results], dtype=np.float32),
+            "duration_alignment": np.asarray([item["duration_alignment"] for item in results], dtype=np.float32),
+            "duration_container": np.asarray([item["duration_container"] for item in results], dtype=np.float32),
             "time_grid": np.stack([item["time_grid"] for item in results]).astype(np.float32),
             "valid_lengths": {
                 modality: np.asarray([item["valid_lengths"][modality] for item in results], dtype=np.int16)
@@ -525,6 +657,12 @@ def run_pipeline(
             "labels": np.asarray([entry["label"] if entry["label"] is not None else np.nan for entry in manifest], dtype=np.float32),
             "annotations": [entry["annotation"] for entry in manifest],
             "status": [item["status"] for item in results],
+            "processing_status": [item["processing_status"] for item in results],
+            "quality_status": [item["quality_status"] for item in results],
+            "modality_status": [item["modality_status"] for item in results],
+            "modality_failure_reasons": [item["modality_failure_reasons"] for item in results],
+            "vision_status": [item["vision_status"] for item in results],
+            "vision_failure_reasons": [item["vision_failure_reason"] for item in results],
             "failure_reasons": [item["failure_reason"] for item in results],
             "metadata": [
                 {
@@ -532,6 +670,11 @@ def run_pipeline(
                     "clip_id": entry["clip_id"],
                     "video_path": entry["video_path_relative"],
                     "sha256": entry["sha256"],
+                    "duration_source": entry["duration_source"],
+                    "text_fallback_ratio": result["stats"]["text_fallback_ratio"],
+                    "text_review_status": result["stats"]["text_review_status"],
+                    "vision_valid_ratio": result["stats"]["vision_valid_ratio"],
+                    "quality_status": result["quality_status"],
                 }
                 for entry in manifest
             ],
@@ -561,23 +704,82 @@ def run_pipeline(
                     "feature_dim_vision": 768,
                     "aligned_length": config.aligned_length,
                     "alignment_granularity": "proportional_50_half_open_intervals",
-                    "feature_status": result["status"],
+                    "feature_status": result["processing_status"],
+                    "processing_status": result["processing_status"],
+                    "quality_status": result["quality_status"],
+                    "text_status": result["modality_status"]["text"],
+                    "audio_status": result["modality_status"]["audio"],
+                    "vision_status": result["vision_status"],
+                    "vision_failure_reason": result["vision_failure_reason"],
+                    "vision_valid_ratio": result["stats"]["vision_valid_ratio"],
+                    "vision_face_detection_ratio": result["stats"]["vision_face_detection_ratio"],
+                    "vision_imputed_ratio": result["stats"]["vision_imputed_ratio"],
+                    "text_fallback_count": result["stats"]["text_fallback_count"],
+                    "text_fallback_ratio": result["stats"]["text_fallback_ratio"],
+                    "text_low_confidence_ratio": result["stats"]["text_low_confidence_ratio"],
+                    "text_timestamp_source": result["stats"]["text_timestamp_source"],
+                    "text_lexical_asr_word_count": result["stats"]["text_lexical_asr_word_count"],
+                    "text_review_status": result["stats"]["text_review_status"],
                     "failure_reason": result["failure_reason"],
                 }
             )
             manifest_rows.append(entry)
-            alignment_row = {"id": entry["id"], "duration": entry["duration"], "status": result["status"], "failure_reason": result["failure_reason"]}
+            alignment_row = {
+                "id": entry["id"],
+                "duration_container": entry["duration_container"],
+                "duration_alignment": entry["duration_alignment"],
+                "duration_source": entry["duration_source"],
+                "processing_status": result["processing_status"],
+                "quality_status": result["quality_status"],
+                "failure_reason": result["failure_reason"],
+            }
             alignment_row.update(result["stats"])
             alignment_rows.append(alignment_row)
         manifest_fields = [
-            "id", "video_id", "clip_id", "video_path_relative", "duration", "raw_text", "label", "annotation",
+            "id", "video_id", "clip_id", "video_path_relative", "raw_text", "label", "annotation",
+            "duration_container", "duration_format", "duration_mvhd", "duration_video_stream", "duration_audio_stream",
+            "duration_video_edit", "duration_audio_edit", "duration_decoded_video", "duration_decoded_audio",
+            "duration_decoded", "duration_alignment", "duration_source", "duration_start_time",
+            "video_edit_list_entries", "audio_edit_list_entries", "video_edit_list_present", "audio_edit_list_present",
             "audio_sample_rate_original", "video_fps", "video_width", "video_height", "text_length", "audio_length",
             "vision_length", "feature_dim_text", "feature_dim_audio", "feature_dim_vision", "aligned_length",
-            "alignment_granularity", "feature_status", "failure_reason", "sha256",
+            "alignment_granularity", "feature_status", "processing_status", "quality_status", "text_status",
+            "audio_status", "vision_status", "vision_failure_reason", "vision_valid_ratio",
+            "vision_face_detection_ratio", "vision_imputed_ratio", "text_fallback_count", "text_fallback_ratio",
+            "text_low_confidence_ratio", "text_timestamp_source", "failure_reason", "sha256",
+            "text_lexical_asr_word_count", "text_review_status",
         ]
         write_csv(manifest_rows, submission_dir / "manifest.csv", manifest_fields)
         alignment_fields = sorted({key for row in alignment_rows for key in row})
         write_csv(alignment_rows, submission_dir / "alignment_log.csv", alignment_fields)
+        write_csv(
+            [
+                {
+                    "id": entry["id"],
+                    "raw_text": entry["raw_text"],
+                    "asr_word_count": result["stats"]["text_asr_word_count"],
+                    "lexical_asr_word_count": result["stats"]["text_lexical_asr_word_count"],
+                    "fallback_count": result["stats"]["text_fallback_count"],
+                    "fallback_ratio": result["stats"]["text_fallback_ratio"],
+                    "invalid_timestamp_count": result["stats"]["text_invalid_timestamp_count"],
+                    "review_status": result["stats"]["text_review_status"],
+                    "asr_words": result["raw_audit"].get("text", {}).get("asr_words", []),
+                }
+                for entry, result in zip(manifest, results)
+            ],
+            submission_dir / "text_review.csv",
+            [
+                "id", "raw_text", "asr_word_count", "lexical_asr_word_count", "fallback_count",
+                "fallback_ratio", "invalid_timestamp_count", "review_status", "asr_words",
+            ],
+        )
+        duration_fields = [
+            "id", "duration_container", "duration_format", "duration_mvhd", "duration_video_stream", "duration_audio_stream",
+            "duration_video_edit", "duration_audio_edit", "duration_decoded_video", "duration_decoded_audio",
+            "duration_decoded", "duration_alignment", "duration_source", "duration_start_time",
+            "video_edit_list_entries", "audio_edit_list_entries", "video_edit_list_present", "audio_edit_list_present",
+        ]
+        write_csv(manifest_rows, submission_dir / "duration_audit.csv", duration_fields)
 
         if bool(config.get("save_unaligned", True)):
             atomic_pickle_dump({"schema_version": "q1.unaligned.v1", "samples": audit_results}, audit_dir / "q1_unaligned.pkl")
@@ -596,38 +798,83 @@ def run_pipeline(
                 quality = np.minimum.reduce(
                     [text_masks.mean(axis=1), audio_masks.mean(axis=1), vision_masks.mean(axis=1)]
                 )
-                typical_index = int(np.argmax(quality))
-                render_sample_figure(
-                    manifest[typical_index]["id"],
-                    {
-                        "time_grid": artifact["time_grid"][typical_index],
-                        "text": artifact["text"][typical_index],
-                        "audio": artifact["audio"][typical_index],
-                        "vision": artifact["vision"][typical_index],
-                        "masks": {key: value[typical_index] for key, value in artifact["masks"].items()},
-                        "vision_emotion_probs": artifact["auxiliary"]["vision_emotion_probs"][typical_index],
-                    },
-                    audit_dir / "typical_sample_alignment.png",
-                )
-                write_json(
-                    {
-                        "id": manifest[typical_index]["id"],
-                        "index": typical_index,
-                        "combined_valid_ratio": float(quality[typical_index]),
-                    },
-                    audit_dir / "typical_sample.json",
-                )
+                id_to_index = {entry["id"]: index for index, entry in enumerate(manifest)}
+                requested_ids = [str(item) for item in config.get("audit_sample_ids", [])]
+                selected_indices = [id_to_index[item] for item in requested_ids if item in id_to_index]
+                if not selected_indices:
+                    selected_indices = [int(np.argmax(quality))]
+                sample_summaries = []
+                for audit_position, sample_index in enumerate(selected_indices):
+                    sample_id = manifest[sample_index]["id"]
+                    safe_sample_id = _safe_name(sample_id)
+                    aligned_view = {
+                        "time_grid": artifact["time_grid"][sample_index],
+                        "text": artifact["text"][sample_index],
+                        "audio": artifact["audio"][sample_index],
+                        "vision": artifact["vision"][sample_index],
+                        "masks": {key: value[sample_index] for key, value in artifact["masks"].items()},
+                        "vision_emotion_probs": artifact["auxiliary"]["vision_emotion_probs"][sample_index],
+                        "text_confidence": artifact["text_confidence"][sample_index],
+                        "text_low_confidence_mask": artifact["text_low_confidence_mask"][sample_index],
+                    }
+                    figure_path = audit_dir / f"typical_sample_{safe_sample_id}_alignment.png"
+                    render_sample_figure(
+                        sample_id,
+                        aligned_view,
+                        figure_path,
+                        raw_audit=audit_results[sample_index],
+                        source_path=Path(manifest[sample_index]["video_path"]),
+                        duration_container=float(manifest[sample_index]["duration_container"]),
+                        duration_alignment=float(manifest[sample_index]["duration_alignment"]),
+                    )
+                    if audit_position == 0:
+                        shutil.copy2(figure_path, audit_dir / "typical_sample_alignment.png")
+                    raw_sample = audit_results[sample_index]
+                    sidecar = {
+                        "id": sample_id,
+                        "index": sample_index,
+                        "duration_container": manifest[sample_index]["duration_container"],
+                        "duration_alignment": manifest[sample_index]["duration_alignment"],
+                        "duration_source": manifest[sample_index]["duration_source"],
+                        "time_grid": artifact["time_grid"][sample_index],
+                        "text_words": raw_sample.get("text", {}).get("words", []),
+                        "asr_words": raw_sample.get("text", {}).get("asr_words", []),
+                        "audio_spans": raw_sample.get("audio", {}).get("spans", []),
+                        "audio_mask": raw_sample.get("audio", {}).get("mask", []),
+                        "vision_spans": raw_sample.get("vision", {}).get("spans", []),
+                        "vision_mask": raw_sample.get("vision", {}).get("mask", []),
+                        "vision_frame_indices": raw_sample.get("vision", {}).get("frame_indices", []),
+                        "face_bbox": raw_sample.get("vision", {}).get("face_bbox", []),
+                        "aligned_masks": {key: value[sample_index] for key, value in artifact["masks"].items()},
+                        "text_confidence": artifact["text_confidence"][sample_index],
+                        "text_low_confidence_mask": artifact["text_low_confidence_mask"][sample_index],
+                    }
+                    write_json(sidecar, audit_dir / f"typical_sample_{safe_sample_id}_sidecar.json")
+                    sample_summaries.append(
+                        {
+                            "id": sample_id,
+                            "index": sample_index,
+                            "combined_valid_ratio": float(quality[sample_index]),
+                            "figure": figure_path.name,
+                            "sidecar": f"typical_sample_{safe_sample_id}_sidecar.json",
+                            "quality_status": results[sample_index]["quality_status"],
+                        }
+                    )
+                write_json(sample_summaries, audit_dir / "typical_samples.json")
+                write_json(sample_summaries[0], audit_dir / "typical_sample.json")
             except Exception as exc:
                 logger.warning("Typical sample visualization was not generated: %s", exc)
 
         from .validate import validate_artifact
 
+        raw_audit_path = audit_dir / "q1_unaligned.pkl"
         validation = validate_artifact(
             artifact_path,
             expected_count=len(manifest),
             expected_dims=config.main_feature_dims,
             require_complete=bool(config.get("require_all_samples_complete", True)) and not allow_failures,
             manifest_path=submission_dir / "manifest.csv",
+            raw_audit_path=raw_audit_path if raw_audit_path.exists() else None,
         )
         write_json(validation, submission_dir / "validation_report.json")
         if validation["errors"]:

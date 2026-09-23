@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+import torch
+from torch import Tensor
+from torch.nn import functional as F
+
+
+def consistency_loss(probabilities: Tensor, intensity: Tensor) -> Tensor:
+    direction = probabilities[:, 2] - probabilities[:, 0]
+    target = intensity / 3.0
+    return F.mse_loss(direction, target)
+
+
+def supervised_loss(
+    logits: Tensor,
+    intensity: Tensor,
+    classification: Tensor,
+    regression: Tensor,
+    class_weights: Tensor | None = None,
+    lambda_regression: float = 1.0,
+    lambda_consistency: float = 0.05,
+) -> tuple[Tensor, dict[str, float]]:
+    probabilities = torch.softmax(logits, dim=-1)
+    ce = F.cross_entropy(logits, classification.long(), weight=class_weights)
+    huber = F.huber_loss(intensity, regression.float(), delta=1.0)
+    consistency = consistency_loss(probabilities, intensity)
+    total = ce + float(lambda_regression) * huber + float(lambda_consistency) * consistency
+    return total, {
+        "total": float(total.detach().cpu()),
+        "cross_entropy": float(ce.detach().cpu()),
+        "huber": float(huber.detach().cpu()),
+        "consistency": float(consistency.detach().cpu()),
+    }
+
+
+def distillation_loss(
+    teacher_logits: Tensor,
+    teacher_intensity: Tensor,
+    student_logits: Tensor,
+    student_intensity: Tensor,
+    temperature: float = 2.0,
+    regression_weight: float = 0.5,
+) -> tuple[Tensor, dict[str, float]]:
+    temperature = max(float(temperature), 1e-3)
+    teacher_probabilities = torch.softmax(teacher_logits.detach() / temperature, dim=-1)
+    student_log_probabilities = torch.log_softmax(student_logits / temperature, dim=-1)
+    kl = F.kl_div(student_log_probabilities, teacher_probabilities, reduction="batchmean") * temperature**2
+    regression = F.huber_loss(student_intensity, teacher_intensity.detach(), delta=1.0)
+    total = kl + float(regression_weight) * regression
+    return total, {
+        "total": float(total.detach().cpu()),
+        "kl": float(kl.detach().cpu()),
+        "teacher_huber": float(regression.detach().cpu()),
+    }
+
