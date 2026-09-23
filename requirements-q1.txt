@@ -1,0 +1,19 @@
+# Install torch from the CUDA 12.1 wheel index on the RTX 3090 host:
+# python -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121
+transformers==4.48.3
+accelerate==1.2.1
+huggingface_hub==0.27.1
+tokenizers==0.21.0
+safetensors==0.5.2
+numpy==1.26.4
+scipy==1.14.1
+Pillow==11.1.0
+opencv-contrib-python==4.11.0.86
+mediapipe==0.10.14
+librosa==0.10.2.post1
+soundfile==0.12.1
+openpyxl==3.1.5
+PyYAML==6.0.2
+matplotlib==3.10.0
+tqdm==4.67.1
+pytest==8.3.4

@@ -1,0 +1,78 @@
+model_profile: uniform_768_reproducible
+model_manifest: models/model_manifest.json
+models_root: models
+run_root: runs
+
+data_root: E题数据
+video_root: E题数据/附件1-数据集原始多模态样本/MOSEI数据集部分原始视频-100条
+label_file: E题数据/附件1-数据集原始多模态样本/MOSEI数据集部分原始视频-100条/label-100.xlsx
+
+text_model: answerdotai/ModernBERT-base
+text_model_path: models/answerdotai--ModernBERT-base
+text_model_revision: 8949b909ec900327062f0ebf497f51aef5e6f0c8
+text_feature_method: masked_lm_hidden_states_last
+text_output_hidden_states: true
+text_token_pooling: word_mean_subtokens
+text_hidden_size: 768
+text_max_length: 8192
+text_match_max_edit_ratio: 0.34
+text_fallback_confidence: 0.20
+
+asr_timestamp_model: openai/whisper-large-v3-turbo
+asr_timestamp_model_path: models/openai--whisper-large-v3-turbo
+asr_timestamp_model_revision: 41f01f3fe87f28c78e2fbf8b568835947dd65ed9
+asr_language: en
+asr_task: transcribe
+asr_return_timestamps: word
+asr_temperature: 0.0
+asr_num_beams: 1
+asr_window_s: 30.0
+asr_overlap_s: 5.0
+
+audio_model: microsoft/wavlm-base-plus
+audio_model_path: models/microsoft--wavlm-base-plus
+audio_model_revision: 4c66d4806a428f2e922ccfa1a962776e232d487b
+audio_hidden_size: 768
+audio_sample_rate: 16000
+audio_frame_time_rule: receptive_field_and_attention_mask
+
+vision_model: dima806/facial_emotions_image_detection
+vision_model_path: models/dima806--facial_emotions_image_detection
+vision_model_revision: 747cf16692eea925b54b7b543cf436848128b68d
+vision_feature_method: hidden_states_last_cls
+vision_output_hidden_states: true
+vision_hidden_size: 768
+vision_input_size: 224
+vision_emotion_classes: [sad, disgust, angry, neutral, fear, surprise, happy]
+
+face_detector: mediapipe_face_detection
+face_detector_version: mediapipe==0.10.14
+face_detector_min_confidence: 0.5
+face_crop_margin: 0.20
+face_track_iou_threshold: 0.20
+face_track_max_gap_frames: 2
+video_decoder: ffmpeg
+video_decoder_version: ffmpeg 7.1.1
+video_timestamp_source: explicit_25fps_resampling
+video_output_fps: 25
+
+main_feature_dims: [768, 768, 768]
+q23_attachment2_dims: [768, 74, 35]
+q1_output_role: independent_feature_file
+q2_q3_input_role: attachment2_interface
+aligned_length: 50
+normalization: zscore
+normalization_scope: valid_aligned_bins_across_question1_samples
+inference_dtype: float32
+output_dtype: float16
+submission_max_bytes: 52428800
+q1_unaligned_role: local_audit_only
+trust_remote_code: false
+random_seed: 2026
+python_version: 3.10.21
+torch_version: 2.5.1+cu121
+transformers_version: 4.48.3
+opencv_version: 4.11.0
+save_unaligned: true
+generate_typical_sample_figure: true
+require_all_samples_complete: true
