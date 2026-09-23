@@ -159,25 +159,50 @@ def selection_score(metric_rows: Iterable[dict[str, Any]]) -> float:
 
 
 def classification_priority_score(metric_rows: Iterable[dict[str, Any]]) -> float:
-    """Predeclared V3 development score emphasizing balanced classification.
+    """Score complete quality and missing-modality robustness separately.
 
-    Regression metrics remain reported and constrained separately, while this
-    score prevents MAE/Pearson from hiding a collapse of the Neutral class.
+    The complete view receives the largest weight, while the masked mean and
+    worst stress case prevent selecting a model that only memorizes the
+    complete-input shortcut.  Regression remains a reported constraint rather
+    than a term that can hide a classification collapse.
     """
 
     rows = [dict(row) for row in metric_rows]
     if not rows:
         return float("-inf")
-    macro = np.asarray([float(row.get("macro_f1", 0.0)) for row in rows], dtype=np.float64)
-    neutral = np.asarray([float(row.get("f1_neutral", 0.0)) for row in rows], dtype=np.float64)
-    accuracy = np.asarray([float(row.get("accuracy", 0.0)) for row in rows], dtype=np.float64)
-    values = (
-        0.50 * float(np.mean(macro))
-        + 0.20 * float(np.mean(neutral))
-        + 0.15 * float(np.mean(accuracy))
-        + 0.15 * float(np.min(macro))
+    complete = [row for row in rows if row.get("scenario") == "complete"]
+    masked = [row for row in rows if row.get("scenario") != "complete"]
+    complete = complete or [rows[0]]
+    masked = masked or complete
+
+    complete_macro = float(np.mean([float(row.get("macro_f1", 0.0)) for row in complete]))
+    complete_neutral = float(np.mean([float(row.get("f1_neutral", 0.0)) for row in complete]))
+    masked_macro = np.asarray(
+        [float(row.get("macro_f1", 0.0)) for row in masked], dtype=np.float64
     )
-    return float(values)
+    finite_masked = masked_macro[np.isfinite(masked_macro)]
+    if finite_masked.size == 0:
+        finite_masked = np.asarray([0.0], dtype=np.float64)
+    # Key stress rows are the heaviest requested missing scenarios.  If the
+    # caller supplied no fraction metadata, the minimum masked result is the
+    # conservative fallback.
+    fractions = np.asarray(
+        [float(row.get("missing_fraction", 0.0)) for row in masked], dtype=np.float64
+    )
+    max_fraction = float(np.nanmax(fractions)) if fractions.size else 0.0
+    stress = [
+        float(row.get("macro_f1", 0.0))
+        for row in masked
+        if abs(float(row.get("missing_fraction", 0.0)) - max_fraction) <= 1e-8
+    ]
+    stress_values = np.asarray(stress if stress else finite_masked, dtype=np.float64)
+    score = (
+        0.45 * complete_macro
+        + 0.30 * float(np.mean(finite_masked))
+        + 0.15 * complete_neutral
+        + 0.10 * float(np.min(stress_values))
+    )
+    return float(score)
 
 
 def majority_and_mean_baseline(split: SplitData) -> dict[str, Any]:

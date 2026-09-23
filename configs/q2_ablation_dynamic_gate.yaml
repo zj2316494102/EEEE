@@ -1,0 +1,4 @@
+base_config: q2_ablation_base.yaml
+code_version: q2_ablation_dynamic_gate
+# Isolate dynamic gating while retaining four attention heads.
+fusion: dynamic

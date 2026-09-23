@@ -19,7 +19,13 @@ from .checkpoint import (
 )
 from .data import SplitData
 from .evaluation import classification_priority_score, evaluate_scenarios, evaluate_split
-from .losses import distillation_loss, supervised_loss
+from .losses import (
+    distillation_loss,
+    masked_reconstruction_loss,
+    modality_auxiliary_loss,
+    representation_consistency_loss,
+    supervised_loss,
+)
 from .masking import (
     MaskScenario,
     apply_whole_modality_dropout,
@@ -103,6 +109,24 @@ def _mask_batch_features(
     }
 
 
+def _apply_text_whole_missing(
+    masks: np.ndarray,
+    rng: np.random.Generator,
+    probability: float,
+) -> np.ndarray:
+    """Delete the continuous text stream for selected samples only."""
+
+    probability = float(np.clip(probability, 0.0, 1.0))
+    if probability <= 0.0 or masks.shape[0] == 0:
+        return masks
+    output = masks.copy()
+    selected = rng.random(output.shape[0]) < probability
+    selected &= output[:, 0].any(axis=1)
+    selected &= output[:, 1:, :].any(axis=(1, 2))
+    output[selected, 0, :] = False
+    return output
+
+
 def _validation_rows(
     model: torch.nn.Module,
     valid: SplitData,
@@ -154,19 +178,48 @@ def train_one_model(
     lambda_regression = float(training_config.get("lambda_regression", 1.0))
     lambda_consistency = float(training_config.get("lambda_consistency", 0.05))
     lambda_neutral_aux = float(training_config.get("lambda_neutral_aux", 0.0))
+    lambda_repr_consistency = float(training_config.get("lambda_repr_consistency", 0.0))
+    lambda_reconstruction = float(training_config.get("lambda_reconstruction", 0.0))
+    lambda_mofe = float(training_config.get("lambda_mofe", 0.0))
+    lambda_modality_aux = float(training_config.get("lambda_modality_aux", 0.0))
     label_smoothing = float(training_config.get("label_smoothing", 0.0))
     focal_gamma = float(training_config.get("focal_gamma", 0.0))
     distill_weight = float(training_config.get("distill_weight", 0.0)) if teacher is not None else 0.0
     distill_temperature = float(training_config.get("distill_temperature", 2.0))
-    distill_regression_weight = float(training_config.get("distill_regression_weight", 0.5))
+    distill_regression_weight = float(training_config.get("distill_regression_weight", 0.0))
+    distill_start_epoch = max(0, int(training_config.get("distill_start_epoch", 5)))
+    distill_ramp_epochs = max(1, int(training_config.get("distill_ramp_epochs", 10)))
+    distill_confidence_gated = bool(training_config.get("distill_confidence_gated", True))
+    distill_confidence_threshold = float(
+        training_config.get("distill_confidence_threshold", 0.70)
+    )
+    distill_confidence_scale = float(training_config.get("distill_confidence_scale", 0.30))
     augmentation_probability = float(training_config.get("mask_augmentation_probability", 0.75))
     max_fraction = float(training_config.get("mask_max_fraction", 0.60))
-    curriculum_enabled = bool(training_config.get("augmentation_curriculum_enabled", False))
-    curriculum_warmup_epochs = max(0, int(training_config.get("curriculum_warmup_epochs", 10)))
-    curriculum_robust_epochs = max(
-        curriculum_warmup_epochs,
-        int(training_config.get("curriculum_robust_epochs", 30)),
+    text_whole_missing_probability = float(
+        training_config.get("text_whole_missing_probability", 0.0)
     )
+    curriculum_enabled = bool(training_config.get("augmentation_curriculum_enabled", False))
+    curriculum_warmup_fraction = training_config.get("curriculum_warmup_fraction")
+    curriculum_transfer_fraction = training_config.get("curriculum_transfer_fraction")
+    if curriculum_warmup_fraction is not None or curriculum_transfer_fraction is not None:
+        warmup_fraction = float(
+            curriculum_warmup_fraction if curriculum_warmup_fraction is not None else 0.30
+        )
+        transfer_fraction = float(
+            curriculum_transfer_fraction if curriculum_transfer_fraction is not None else 0.70
+        )
+        curriculum_warmup_epochs = max(0, min(max_epochs, round(max_epochs * warmup_fraction)))
+        curriculum_robust_epochs = max(
+            curriculum_warmup_epochs,
+            min(max_epochs, round(max_epochs * transfer_fraction)),
+        )
+    else:
+        curriculum_warmup_epochs = max(0, int(training_config.get("curriculum_warmup_epochs", 10)))
+        curriculum_robust_epochs = max(
+            curriculum_warmup_epochs,
+            int(training_config.get("curriculum_robust_epochs", 30)),
+        )
     warmup_probability = float(
         training_config.get("warmup_mask_augmentation_probability", 0.40)
     )
@@ -192,6 +245,18 @@ def train_one_model(
     gradient_clip = float(training_config.get("gradient_clip_norm", 1.0))
     num_workers = int(training_config.get("num_workers", 0))
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    scheduler_name = str(training_config.get("scheduler", "none")).lower()
+    scheduler: Any | None
+    if scheduler_name == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(max_epochs, 1),
+            eta_min=float(training_config.get("min_learning_rate", 1e-6)),
+        )
+    elif scheduler_name in {"none", ""}:
+        scheduler = None
+    else:
+        raise ValueError("scheduler must be 'none' or 'cosine'")
     weights = torch.as_tensor(
         class_weights if class_weights is not None else np.ones(3, dtype=np.float32),
         dtype=torch.float32,
@@ -206,6 +271,7 @@ def train_one_model(
     stale_epochs = 0
     start_epoch = 1
     last_epoch = 0
+    global_step = 0
     resumed = False
     resume_epoch = 0
     checkpoint_file = Path(checkpoint_path) if checkpoint_path is not None else None
@@ -220,8 +286,20 @@ def train_one_model(
         if epoch <= curriculum_warmup_epochs:
             return "warmup", warmup_probability, warmup_max_fraction
         if epoch <= curriculum_robust_epochs:
-            return "robust", robust_probability, robust_max_fraction
+            progress = (epoch - curriculum_warmup_epochs) / max(
+                curriculum_robust_epochs - curriculum_warmup_epochs, 1
+            )
+            progress = float(np.clip(progress, 0.0, 1.0))
+            probability = warmup_probability + progress * (robust_probability - warmup_probability)
+            fraction = warmup_max_fraction + progress * (robust_max_fraction - warmup_max_fraction)
+            return "robust", probability, fraction
         return "transfer", transfer_probability, transfer_max_fraction
+
+    def distillation_weight_for_epoch(epoch: int) -> float:
+        if teacher is None or distill_weight <= 0.0 or epoch <= distill_start_epoch:
+            return 0.0
+        progress = (epoch - distill_start_epoch) / max(distill_ramp_epochs, 1)
+        return distill_weight * float(np.clip(progress, 0.0, 1.0))
 
     def save_checkpoint(epoch: int, completed: bool) -> None:
         if checkpoint_file is None:
@@ -241,12 +319,19 @@ def train_one_model(
             history=history,
             rng_state=capture_rng_state(rng),
             metadata=checkpoint_metadata,
+            scheduler_state_dict=None if scheduler is None else scheduler.state_dict(),
+            scaler_state_dict=None,
+            global_step=global_step,
+            augmentation_state={
+                "phase": augmentation_settings(epoch)[0] if epoch > 0 else "initial",
+                "rng_seed_offset": 7919,
+            },
         )
         atomic_torch_save(payload, checkpoint_file)
 
     if resume_path is not None and Path(resume_path).exists():
         payload = load_torch_checkpoint(resume_path, device_obj)
-        if int(payload.get("checkpoint_version", 0)) != 1:
+        if int(payload.get("checkpoint_version", 0)) not in {1, 2}:
             raise RuntimeError(f"Unsupported checkpoint version: {resume_path}")
         if str(payload.get("stage")) != stage:
             raise RuntimeError(
@@ -258,7 +343,14 @@ def train_one_model(
             )
         expected_metadata = dict(checkpoint_metadata or {})
         saved_metadata = dict(payload.get("metadata") or {})
-        for key in ("config_hash", "feature_version", "sample_limit"):
+        for key in (
+            "config_hash",
+            "code_version",
+            "feature_version",
+            "sample_limit",
+            "input_file_sha256",
+            "normalization_file_sha256",
+        ):
             if key in expected_metadata and key in saved_metadata and expected_metadata[key] != saved_metadata[key]:
                 raise RuntimeError(
                     f"Checkpoint metadata mismatch for {key}: "
@@ -268,6 +360,9 @@ def train_one_model(
         optimizer_state = payload.get("optimizer_state_dict")
         if optimizer_state:
             optimizer.load_state_dict(optimizer_state)
+        scheduler_state = payload.get("scheduler_state_dict")
+        if scheduler is not None and scheduler_state:
+            scheduler.load_state_dict(scheduler_state)
         history = list(payload.get("history") or [])
         best_epoch = int(payload.get("best_epoch", 0))
         best_score = float(payload.get("best_score", "-inf"))
@@ -277,6 +372,7 @@ def train_one_model(
         resume_epoch = int(payload.get("epoch", 0))
         start_epoch = resume_epoch + 1
         last_epoch = resume_epoch
+        global_step = int(payload.get("global_step", 0))
         resumed = True
         restore_rng_state(payload.get("rng_state") or {}, rng)
         if bool(payload.get("completed", False)):
@@ -302,9 +398,15 @@ def train_one_model(
             "huber": 0.0,
             "consistency": 0.0,
             "neutral_aux": 0.0,
+            "representation_consistency": 0.0,
+            "reconstruction": 0.0,
+            "mofe": 0.0,
+            "modality_auxiliary": 0.0,
             "distillation": 0.0,
+            "distillation_gate": 0.0,
         }
         augmentation_phase, epoch_probability, epoch_max_fraction = augmentation_settings(epoch)
+        epoch_distill_weight = distillation_weight_for_epoch(epoch)
         for batch in loader:
             features = _move_nested(batch["features"], device_obj)
             masks_dict = _move_nested(batch["masks"], device_obj)
@@ -333,15 +435,30 @@ def train_one_model(
                         probability=whole_modality_dropout_probability,
                         keep_at_least_one_modality=True,
                     )
+                if text_whole_missing_probability > 0.0:
+                    augmented_numpy = _apply_text_whole_missing(
+                        augmented_numpy,
+                        rng,
+                        probability=text_whole_missing_probability,
+                    )
                 augmented_masks = torch.from_numpy(augmented_numpy).to(device_obj)
             else:
                 augmented_masks = base_masks
+            synthetic_missing = base_masks & ~augmented_masks
             masked_features = _mask_batch_features(features, augmented_masks)
             augmented_masks_dict = {
                 modality: augmented_masks[:, index]
                 for index, modality in enumerate(("text", "audio", "vision"))
             }
             output = model(masked_features, augmented_masks_dict)
+            if lambda_reconstruction > 0.0 and "reconstruction" not in output:
+                raise RuntimeError(
+                    "lambda_reconstruction > 0 requires model reconstruction_enabled=true"
+                )
+            if lambda_modality_aux > 0.0 and "modality_logits" not in output:
+                raise RuntimeError(
+                    "lambda_modality_aux > 0 requires model modality_auxiliary_enabled=true"
+                )
             classification = batch["classification"].to(device_obj, non_blocking=True)
             regression = batch["regression"].to(device_obj, non_blocking=True)
             loss, loss_items = supervised_loss(
@@ -357,7 +474,63 @@ def train_one_model(
                 label_smoothing=label_smoothing,
                 focal_gamma=focal_gamma,
             )
-            if teacher is not None and distill_weight > 0:
+            if lambda_modality_aux > 0.0:
+                modality_auxiliary = modality_auxiliary_loss(
+                    output["modality_logits"],
+                    classification,
+                    modality_available=augmented_masks.any(dim=2),
+                )
+                loss = loss + lambda_modality_aux * modality_auxiliary
+                loss_items["modality_auxiliary"] = float(modality_auxiliary.detach().cpu())
+            need_native_output = lambda_repr_consistency > 0.0 or lambda_mofe > 0.0
+            native_output: dict[str, Any] | None = None
+            if need_native_output:
+                model_was_training = model.training
+                model.eval()
+                with torch.no_grad():
+                    native_output = model(full_features, masks_dict)
+                if model_was_training:
+                    model.train()
+            if lambda_repr_consistency > 0.0 and native_output is not None:
+                representation = representation_consistency_loss(
+                    native_output["representation"],
+                    output["representation"],
+                    sample_mask=synthetic_missing.any(dim=(1, 2)),
+                )
+                loss = loss + lambda_repr_consistency * representation
+                loss_items["representation_consistency"] = float(representation.detach().cpu())
+            if lambda_reconstruction > 0.0 and "reconstruction" in output:
+                reconstruction = masked_reconstruction_loss(
+                    output["reconstruction"],
+                    full_features,
+                    synthetic_missing,
+                )
+                loss = loss + lambda_reconstruction * reconstruction
+                loss_items["reconstruction"] = float(reconstruction.detach().cpu())
+            if lambda_mofe > 0.0 and native_output is not None:
+                native_loss, _ = supervised_loss(
+                    native_output["logits"],
+                    native_output["intensity"],
+                    classification,
+                    regression,
+                    class_weights=weights,
+                    lambda_regression=lambda_regression,
+                    lambda_consistency=lambda_consistency,
+                    neutral_aux_logit=native_output.get("neutral_aux_logit"),
+                    lambda_neutral_aux=lambda_neutral_aux,
+                    label_smoothing=label_smoothing,
+                    focal_gamma=focal_gamma,
+                )
+                if lambda_modality_aux > 0.0 and "modality_logits" in native_output:
+                    native_loss = native_loss + lambda_modality_aux * modality_auxiliary_loss(
+                        native_output["modality_logits"],
+                        classification,
+                        modality_available=base_masks.any(dim=2),
+                    )
+                mofe = torch.relu(native_loss.detach() - loss)
+                loss = loss + lambda_mofe * mofe
+                loss_items["mofe"] = float(mofe.detach().cpu())
+            if teacher is not None and epoch_distill_weight > 0:
                 with torch.no_grad():
                     teacher_output = teacher(full_features, masks_dict)
                 kd, kd_items = distillation_loss(
@@ -367,20 +540,35 @@ def train_one_model(
                     output["intensity"],
                     temperature=distill_temperature,
                     regression_weight=distill_regression_weight,
+                    confidence_gated=distill_confidence_gated,
+                    confidence_threshold=distill_confidence_threshold,
+                    confidence_scale=distill_confidence_scale,
                 )
-                loss = loss + distill_weight * kd
+                loss = loss + epoch_distill_weight * kd
                 loss_items["distillation"] = float(kd_items["total"])
+                loss_items["distillation_gate"] = float(kd_items["distillation_gate"])
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if gradient_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip)
             optimizer.step()
+            global_step += 1
             count = int(classification.shape[0])
             total_loss += float(loss.detach().cpu()) * count
             seen += count
-            for key in ("cross_entropy", "huber", "consistency", "neutral_aux"):
-                loss_sums[key] += loss_items[key] * count
+            for key in (
+                "cross_entropy",
+                "huber",
+                "consistency",
+                "neutral_aux",
+                "representation_consistency",
+                "reconstruction",
+                "mofe",
+                "modality_auxiliary",
+            ):
+                loss_sums[key] += loss_items.get(key, 0.0) * count
             loss_sums["distillation"] += loss_items.get("distillation", 0.0) * count
+            loss_sums["distillation_gate"] += loss_items.get("distillation_gate", 0.0) * count
 
         validation_rows, score = _validation_rows(
             model, valid, selection_scenarios, device_obj, batch_size
@@ -394,10 +582,17 @@ def train_one_model(
             "train_huber": loss_sums["huber"] / max(seen, 1),
             "train_consistency": loss_sums["consistency"] / max(seen, 1),
             "train_neutral_aux": loss_sums["neutral_aux"] / max(seen, 1),
+            "train_representation_consistency": loss_sums["representation_consistency"] / max(seen, 1),
+            "train_reconstruction": loss_sums["reconstruction"] / max(seen, 1),
+            "train_mofe": loss_sums["mofe"] / max(seen, 1),
+            "train_modality_auxiliary": loss_sums["modality_auxiliary"] / max(seen, 1),
             "train_distillation": loss_sums["distillation"] / max(seen, 1),
+            "train_distillation_gate": loss_sums["distillation_gate"] / max(seen, 1),
             "augmentation_phase": augmentation_phase,
             "augmentation_probability": epoch_probability,
             "augmentation_max_fraction": epoch_max_fraction,
+            "distillation_weight": epoch_distill_weight,
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "validation_selection_score": score,
             "validation_accuracy": complete.get("accuracy"),
             "validation_macro_f1": complete.get("macro_f1"),
@@ -412,6 +607,8 @@ def train_one_model(
             stale_epochs = 0
         else:
             stale_epochs += 1
+        if scheduler is not None:
+            scheduler.step()
         # The checkpoint is written only after the complete epoch, including
         # validation, has finished. A killed process therefore resumes from a
         # known-good epoch rather than a half-written batch.

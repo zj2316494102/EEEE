@@ -290,6 +290,32 @@ def _row_nonzero_mask(values: np.ndarray) -> np.ndarray:
     return finite & nonzero
 
 
+def _text_attention_mask(
+    raw: Mapping[str, Any], n: int, length: int
+) -> np.ndarray | None:
+    """Read the attention row stored in ``text_bert`` for continuous text.
+
+    The aligned feature file stores ``text_bert`` as three rows per sample:
+    token IDs, attention mask and token-type IDs.  It is metadata for masking,
+    not a fourth continuous modality.  A small layout fallback is retained so
+    the loader can also read exports that put the three rows on the last axis.
+    """
+
+    if "text_bert" not in raw or raw.get("text_bert") is None:
+        return None
+    values = np.asarray(raw["text_bert"])
+    if values.shape == (n, 3, length):
+        attention = values[:, 1, :]
+    elif values.shape == (n, length, 3):
+        attention = values[:, :, 1]
+    else:
+        raise ValueError(
+            "text_bert must have shape [N, 3, T] or [N, T, 3] when used "
+            f"for text masks; got {values.shape}"
+        )
+    return np.isfinite(attention) & np.isclose(attention, 1.0)
+
+
 def _extract_feature(raw: Mapping[str, Any], modality: str, n: int, length: int) -> tuple[np.ndarray, np.ndarray, str]:
     values = raw.get(modality)
     if values is None:
@@ -307,6 +333,18 @@ def _extract_feature(raw: Mapping[str, Any], modality: str, n: int, length: int)
     # Even a length mask cannot establish that an all-zero vector is observed.
     if source == "explicit_length":
         mask &= _row_nonzero_mask(output)
+    if modality == "text":
+        attention_mask = _text_attention_mask(raw, n, length)
+        if attention_mask is not None:
+            # For continuous text the attention row is authoritative for
+            # padding.  Do not re-apply the zero-vector heuristic here: a
+            # valid text position is allowed to have an all-zero embedding.
+            mask = attention_mask if source == "zero_row_heuristic" else mask & attention_mask
+            source = (
+                "text_bert_attention_mask"
+                if source == "zero_row_heuristic"
+                else f"{source}+text_bert_attention_mask"
+            )
     output = output.copy()
     output[~mask] = 0.0
     return output, mask, source
@@ -380,7 +418,10 @@ def _extract_split(
     metadata = {
         "raw_keys": sorted(str(key) for key in raw.keys()),
         "text_bert_ignored": "text_bert" in raw and "text" not in raw,
-        "zero_row_mask_ambiguity": any(source == "zero_row_heuristic" for source in sources.values()),
+        "text_attention_mask_used": sources.get("text", "").endswith("text_bert_attention_mask"),
+        "zero_row_mask_ambiguity": any(
+            source == "zero_row_heuristic" for source in sources.values()
+        ),
     }
     return SplitData(
         name=name,
@@ -464,9 +505,11 @@ def load_aligned_dataset(
         "labels": label_metadata,
         "neutral_zero_check": neutral_zero_check,
         "mask_sources": {name: split.mask_sources for name, split in splits.items()},
+        "split_metadata": {name: split.metadata for name, split in splits.items()},
         "mask_ambiguity_note": (
-            "No explicit aligned masks were present; zero rows were treated as unavailable. "
-            "Padding and physical missingness cannot be separated for those rows."
+            "Continuous text uses text_bert attention row 1 when available; audio/vision "
+            "without explicit masks still use zero-row availability, so padding and "
+            "physical missingness cannot be separated for those rows."
         ),
     }
     return DatasetBundle(

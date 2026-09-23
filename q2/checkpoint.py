@@ -92,9 +92,13 @@ def make_training_checkpoint(
     history: list[dict[str, Any]],
     rng_state: Mapping[str, Any],
     metadata: Mapping[str, Any] | None = None,
+    scheduler_state_dict: Mapping[str, Any] | None = None,
+    scaler_state_dict: Mapping[str, Any] | None = None,
+    global_step: int = 0,
+    augmentation_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
-        "checkpoint_version": 1,
+        "checkpoint_version": 2,
         "stage": stage,
         "seed": int(seed),
         "epoch": int(epoch),
@@ -108,6 +112,9 @@ def make_training_checkpoint(
         "stale_epochs": int(stale_epochs),
         "history": list(history),
         "rng_state": dict(rng_state),
+        "scheduler_state_dict": None if scheduler_state_dict is None else _to_cpu(dict(scheduler_state_dict)),
+        "scaler_state_dict": None if scaler_state_dict is None else _to_cpu(dict(scaler_state_dict)),
+        "global_step": int(global_step),
+        "augmentation_state": None if augmentation_state is None else dict(augmentation_state),
         "metadata": dict(metadata or {}),
     }
-

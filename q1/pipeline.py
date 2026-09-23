@@ -20,6 +20,11 @@ import numpy as np
 from .alignment import align_text_words, make_time_grid, overlap_pool, standardize_aligned
 from .config import Q1Config, dump_yaml, load_config
 from .extractors import ASRAligner, AudioExtractor, TextExtractor, VisionExtractor
+from .quality_reports import (
+    aggregate_alignment_quality,
+    compute_trimodal_temporal_alignment,
+    render_quality_reports,
+)
 from .utils import (
     atomic_pickle_dump,
     command_version,
@@ -256,13 +261,17 @@ def _empty_result(config: Q1Config, entry: dict[str, Any], reason: str) -> dict[
     text_dim, audio_dim, vision_dim = config.main_feature_dims
     return {
         "text": np.zeros((length, text_dim), dtype=np.float32),
+        "text_semantic_available": 0,
         "audio": np.zeros((length, audio_dim), dtype=np.float32),
         "vision": np.zeros((length, vision_dim), dtype=np.float32),
         "text_mask": np.zeros(length, dtype=np.uint8),
+        "text_reliable_mask": np.zeros(length, dtype=np.uint8),
         "text_confidence": np.zeros(length, dtype=np.float32),
         "text_low_confidence_mask": np.zeros(length, dtype=np.uint8),
         "audio_mask": np.zeros(length, dtype=np.uint8),
         "vision_mask": np.zeros(length, dtype=np.uint8),
+        "vision_quality_aligned": np.zeros(length, dtype=np.float32),
+        "vision_weight_sum": np.zeros(length, dtype=np.float32),
         "vision_emotion_probs": np.zeros((length, 7), dtype=np.float32),
         "audio_prosody": np.zeros((length, 5), dtype=np.float32),
         "audio_prosody_mask": np.zeros(length, dtype=np.uint8),
@@ -273,7 +282,13 @@ def _empty_result(config: Q1Config, entry: dict[str, Any], reason: str) -> dict[
         "raw_lengths": {"text": 0, "audio": 0, "vision": 0},
         "valid_lengths": {"text": 0, "audio": 0, "vision": 0},
         "stats": {
+            "text_semantic_available": 0,
             "text_valid_ratio": 0.0,
+            "text_reliable_ratio": 0.0,
+            "text_word_count": 0,
+            "text_timestamp_valid_word_count": 0,
+            "text_matched_word_count": 0,
+            "text_reliable_word_count": 0,
             "text_low_confidence_ratio": 0.0,
             "text_fallback_count": 0,
             "text_fallback_ratio": 0.0,
@@ -284,7 +299,13 @@ def _empty_result(config: Q1Config, entry: dict[str, Any], reason: str) -> dict[
             "text_asr_selected_profile": "none",
             "text_asr_attempt_count": 0,
             "audio_valid_ratio": 0.0,
+            "audio_raw_frame_count": 0,
+            "audio_valid_raw_frame_count": 0,
+            "audio_raw_valid_ratio": 0.0,
             "vision_valid_ratio": 0.0,
+            "vision_raw_frame_count": 0,
+            "vision_valid_raw_frame_count": 0,
+            "vision_raw_valid_ratio": 0.0,
             "vision_face_detection_ratio": 0.0,
             "vision_imputed_ratio": 0.0,
             "failure_reason": reason,
@@ -298,6 +319,11 @@ def _empty_result(config: Q1Config, entry: dict[str, Any], reason: str) -> dict[
         "vision_status": "missing",
         "vision_failure_reason": reason,
         "failure_reason": reason,
+        "alignment_quality": {
+            "trimodal_temporal_alignment_score": None,
+            "joint_support_bins": 0,
+            "alignment_status": "processing_failed",
+        },
     }
 
 
@@ -314,6 +340,7 @@ def process_sample(
     sample_rate = int(config.get("audio_sample_rate", 16000))
     audio = extract_audio(Path(entry["video_path"]), sample_rate)
     text_raw = text_extractor.extract(entry["raw_text"])
+    text_semantic_available = int(np.asarray(text_raw.features).ndim == 2 and text_raw.features.shape[0] > 0)
 
     def align_candidate(candidate_words: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return align_text_words(
@@ -417,6 +444,27 @@ def process_sample(
         (text_mask.astype(bool))
         & (text_confidence_aligned < float(config.get("text_low_confidence_threshold", 0.50)))
     ).astype(np.uint8)
+    reliable_text_flags = np.asarray(
+        [
+            bool(aligned_words[index].get("time_valid"))
+            and not bool(aligned_words[index].get("fallback"))
+            and float(aligned_words[index].get("confidence", 0.0)) >= float(config.get("text_low_confidence_threshold", 0.50))
+            for index in valid_text_indices
+        ],
+        dtype=np.float32,
+    )
+    if len(text_features):
+        text_reliable_score, _, _ = overlap_pool(
+            reliable_text_flags[:, None],
+            text_spans,
+            grid,
+            valid_mask=np.ones(len(text_features), dtype=bool),
+        )
+        text_reliable_mask = (
+            text_mask.astype(bool) & (text_reliable_score[:, 0] >= 0.50)
+        ).astype(np.uint8)
+    else:
+        text_reliable_mask = np.zeros(config.aligned_length, dtype=np.uint8)
 
     audio_raw = audio_extractor.extract(audio, duration)
     audio_aligned, audio_mask, audio_weights = overlap_pool(
@@ -442,6 +490,13 @@ def process_sample(
         quality=vision_raw.quality,
         valid_mask=vision_raw.mask.astype(bool),
     )
+    vision_quality_aligned, _, _ = overlap_pool(
+        vision_raw.quality[:, None],
+        vision_raw.spans,
+        grid,
+        valid_mask=vision_raw.mask.astype(bool),
+    )
+    vision_quality_aligned = np.clip(vision_quality_aligned[:, 0], 0.0, 1.0).astype(np.float32)
     emotion_aligned, emotion_mask, _ = overlap_pool(
         vision_raw.emotion_probs,
         vision_raw.spans,
@@ -455,6 +510,7 @@ def process_sample(
     text_invalid_timestamp_count = int(selected_summary["invalid_timestamp_count"])
     text_fallback_ratio = text_fallback_count / max(len(aligned_words), 1)
     text_low_confidence_ratio = float(text_low_confidence_mask.mean())
+    text_reliable_ratio = float(text_reliable_mask.mean())
     vision_valid_ratio = float(vision_mask.mean())
     vision_face_detection_ratio = float(vision_raw.detector_stats.get("face_detection_ratio", 0.0))
     vision_threshold = float(config.get("vision_degraded_threshold", 0.50))
@@ -492,12 +548,29 @@ def process_sample(
         "audio": int(audio_mask.sum()),
         "vision": int(vision_mask.sum()),
     }
+    audio_valid_raw_frame_count = int(np.asarray(audio_raw.mask, dtype=bool).sum())
+    vision_valid_raw_frame_count = int(np.asarray(vision_raw.mask, dtype=bool).sum())
+    text_timestamp_valid_word_count = int(len(valid_text_indices))
+    text_matched_word_count = int(selected_summary["exact_match_count"] + selected_summary["edit_match_count"])
+    text_reliable_word_count = int(
+        sum(
+            bool(item.get("time_valid"))
+            and not bool(item.get("fallback"))
+            and float(item.get("confidence", 0.0)) >= float(config.get("text_low_confidence_threshold", 0.50))
+            for item in aligned_words
+        )
+    )
     stats = {
+        "text_semantic_available": text_semantic_available,
         "text_valid_ratio": float(text_mask.mean()),
+        "text_reliable_ratio": text_reliable_ratio,
         "text_low_confidence_ratio": text_low_confidence_ratio,
         "audio_valid_ratio": float(audio_mask.mean()),
         "vision_valid_ratio": vision_valid_ratio,
         "text_word_count": len(aligned_words),
+        "text_timestamp_valid_word_count": text_timestamp_valid_word_count,
+        "text_matched_word_count": text_matched_word_count,
+        "text_reliable_word_count": text_reliable_word_count,
         "text_asr_word_count": len(asr_words),
         "text_exact_match_count": int(selected_summary["exact_match_count"]),
         "text_edit_match_count": int(selected_summary["edit_match_count"]),
@@ -512,8 +585,12 @@ def process_sample(
         "text_asr_selected_profile": selected_profile,
         "text_asr_attempt_count": len(asr_attempts),
         "audio_raw_frame_count": int(len(audio_raw.features)),
+        "audio_valid_raw_frame_count": audio_valid_raw_frame_count,
+        "audio_raw_valid_ratio": float(audio_valid_raw_frame_count / max(len(audio_raw.features), 1)),
         "audio_decoded_duration": float(len(audio) / max(sample_rate, 1)),
         "vision_raw_frame_count": int(vision_raw.frame_count),
+        "vision_valid_raw_frame_count": vision_valid_raw_frame_count,
+        "vision_raw_valid_ratio": float(vision_valid_raw_frame_count / max(int(vision_raw.frame_count), 1)),
         "vision_decoded_frame_count": int(vision_raw.detector_stats.get("decoded_frames", vision_raw.frame_count)),
         "vision_discarded_out_of_timeline_frames": int(vision_raw.detector_stats.get("discarded_out_of_timeline_frames", 0)),
         "vision_face_frame_count": int(vision_raw.detector_stats["face_frames"]),
@@ -560,13 +637,17 @@ def process_sample(
     }
     return {
         "text": text_aligned,
+        "text_semantic_available": text_semantic_available,
         "audio": audio_aligned,
         "vision": vision_aligned,
         "text_mask": text_mask,
+        "text_reliable_mask": text_reliable_mask,
         "text_confidence": text_confidence_aligned,
         "text_low_confidence_mask": text_low_confidence_mask,
         "audio_mask": audio_mask,
         "vision_mask": vision_mask,
+        "vision_quality_aligned": vision_quality_aligned,
+        "vision_weight_sum": vision_weights.astype(np.float32),
         "vision_emotion_probs": emotion_aligned,
         "audio_prosody": prosody_aligned,
         "audio_prosody_mask": prosody_mask,
@@ -590,6 +671,11 @@ def process_sample(
         "vision_status": vision_status,
         "vision_failure_reason": vision_failure_reason,
         "failure_reason": "",
+        "alignment_quality": {
+            "trimodal_temporal_alignment_score": None,
+            "joint_support_bins": 0,
+            "alignment_status": "not_computed",
+        },
     }
 
 
@@ -636,7 +722,7 @@ vision [N, 50, 768]
 
 The Question 2 and Question 3 models must continue to use attachment 2's `768/74/35` interface. This artifact is not a replacement for attachment 2.
 
-The provided transcript is retained as `raw_text`. Whisper word timestamps are used only to locate the provided words in time. Text matching uses conservative normalization plus monotonic dynamic programming; high-fallback samples may receive one logged beam/temperature retry, and the retry is selected only when it improves coverage without increasing invalid timestamps. The 50 bins are proportional half-open intervals over `duration_alignment`, which follows the edit-list-aware FFmpeg presentation timeline. The source container/movie-header (`mvhd`) duration is retained separately as `duration_container` for auditing. Each feature is pooled by temporal overlap and quality weight. Invalid bins are zero after standardization and have mask value 0.
+The provided transcript is retained as `raw_text`. Whisper word timestamps are used only to locate the provided words in time. Text matching uses conservative normalization plus monotonic dynamic programming; high-fallback samples may receive one logged beam/temperature retry, and the retry is selected only when it improves coverage without increasing invalid timestamps. The 50 bins are proportional half-open intervals over `duration_alignment`, which follows the edit-list-aware FFmpeg presentation timeline. The source container/movie-header (`mvhd`) duration is retained separately as `duration_container` for auditing. Each feature is pooled by temporal overlap and quality weight. Invalid bins are zero after standardization and have mask value 0; `text_reliable` distinguishes matched text timing from fallback timing.
 
 Run ID: `{run_id}`  
 Config hash: `{config.config_hash}`  
@@ -650,14 +736,18 @@ Files:
 - `duration_audit.csv`: container, stream, decoded and selected alignment durations.
 - `text_review.csv`: per-sample ASR lexical coverage, fallback ratio and manual-review status.
 - `text_audit_summary.csv`: lightweight per-sample text conclusion for review and reuse.
+- `effective_length_summary.csv`: raw and 50-bin effective length statistics.
+- `alignment_quality.csv`: the single `trimodal_temporal_alignment_score` with joint-support bins and status.
 - `normalization.json`: per-modality z-score parameters computed from valid Question 1 bins.
 - `config.yaml`: resolved configuration and runtime versions.
 
-`processing_status` describes whether extraction completed. `quality_status` and `vision_status` separately identify degraded or missing modalities. Text fallback words remain traceable in the audit files and are represented by `text_confidence` and `text_low_confidence_mask`.
+`processing_status` describes whether extraction completed. `quality_status` and `vision_status` separately identify degraded or missing modalities. Text fallback words remain traceable in the audit files and are represented by `text_confidence`, `text_low_confidence_mask` and `masks.text_reliable`.
 
 `duration_alignment` is the video edit-list presentation axis. `duration_container` is retained for source-range checks. Positive decoded endpoint gaps are expected only within the recorded endpoint rule; the uncovered tail is not imputed and remains masked.
 
 The compact reproducibility archive additionally contains the Question 1 source code, the source configuration, environment snapshots, execution entry points, and typical-sample figures/sidecars. The full `q1_unaligned.pkl`, model weights, source videos and caches remain outside the archive.
+
+The report figures include the trimodal temporal-alignment dashboard, label and dimension overview, text word-position audit, TMA score distribution, effective coverage, and a compact storage specification. Intermediate runs do not create a submission archive; the archive is generated only when `--build-package` is explicitly supplied.
 """
 
 
@@ -670,16 +760,26 @@ PACKAGE_REQUIRED_PATHS = [
     "q1_submission/duration_audit.csv",
     "q1_submission/text_review.csv",
     "q1_submission/text_audit_summary.csv",
+    "q1_submission/effective_length_summary.csv",
+    "q1_submission/alignment_quality.csv",
     "q1_submission/validation_report.json",
     "code/q1/pipeline.py",
     "code/q1/validate.py",
     "code/q1/utils.py",
+    "code/q1/quality_reports.py",
     "config/q1.yaml",
     "environment/environment.json",
     "environment/pip_freeze.txt",
     "tools/run_q1.sh",
     "tools/validate_q1.sh",
     "audit/typical_samples.json",
+    "audit/alignment_quality_summary.json",
+    "audit/result_figures.json",
+    "audit/figures/图1_三模态时序对齐质量概览.png",
+    "audit/figures/图2_标签与特征维度概览.png",
+    "audit/figures/图3_文本位置与三模态观测信号.png",
+    "audit/figures/图4_三模态对齐分数与有效覆盖率.png",
+    "audit/figures/图5_特征文件存储规范.png",
 ]
 
 
@@ -726,13 +826,18 @@ def _prepare_submission_package(
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
 
-    for source in (audit_dir.iterdir() if audit_dir.exists() else []):
+    for source in (audit_dir.rglob("*") if audit_dir.exists() else []):
         if not source.is_file():
             continue
-        if source.suffix.lower() in {".png", ".json"} and (
-            source.name.startswith("typical_sample") or source.name == "typical_samples.json"
-        ):
-            target = package_root / "audit" / source.name
+        relative = source.relative_to(audit_dir)
+        include = source.suffix.lower() == ".png" or source.name in {
+            "typical_samples.json",
+            "typical_sample.json",
+            "alignment_quality_summary.json",
+            "result_figures.json",
+        }
+        if include:
+            target = package_root / "audit" / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
 
@@ -741,7 +846,7 @@ def _prepare_submission_package(
 
 Run ID: `{run_id}`
 
-This archive contains the Question 1 aligned feature output, the source code and configuration used to generate it, the remote environment snapshot, execution entry points, and typical-sample audit figures with sidecars.
+This archive contains the Question 1 aligned feature output, compact quality summaries, the source code and configuration used to generate it, the remote environment snapshot, execution entry points, and report figures with typical-sample audit sidecars.
 
 The alignment axis is the video edit-list presentation timeline. The container duration, decoded endpoints, endpoint differences, masks, fallback records and quality statuses are retained in `q1_submission/`.
 
@@ -844,7 +949,11 @@ def run_pipeline(
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         logger.info("Inference device: %s", device)
         models_root = config.path_for("models_root")
-        text_extractor = TextExtractor(config.path_for("text_model_path"), device, int(config.get("text_max_length", 8192)))
+        text_extractor = TextExtractor(
+            config.path_for("text_model_path"),
+            device,
+            int(config.get("text_max_length", 8192)),
+        )
         asr_aligner = ASRAligner(
             config.path_for("asr_timestamp_model_path"),
             device,
@@ -902,13 +1011,31 @@ def run_pipeline(
         text_stack, text_mean, text_std, _ = standardize_aligned(text_stack, text_masks)
         audio_stack, audio_mean, audio_std, _ = standardize_aligned(audio_stack, audio_masks)
         vision_stack, vision_mean, vision_std, _ = standardize_aligned(vision_stack, vision_masks)
+        for index, result in enumerate(results):
+            alignment_quality = compute_trimodal_temporal_alignment(
+                text_mask=result["text_mask"],
+                text_confidence=result["text_confidence"],
+                audio_mask=result["audio_mask"],
+                audio_prosody=result["audio_prosody"],
+                audio_prosody_mask=result["audio_prosody_mask"],
+                vision_mask=result["vision_mask"],
+                vision_quality_aligned=result["vision_quality_aligned"],
+                audio_rms_quantile_low=float(config.get("trimodal_audio_rms_quantile_low", 0.10)),
+                audio_rms_quantile_high=float(config.get("trimodal_audio_rms_quantile_high", 0.90)),
+                min_joint_bins=int(config.get("trimodal_min_joint_support_bins", 3)),
+            )
+            result["alignment_quality"] = alignment_quality
+            result["stats"].update(alignment_quality)
         submission_dir.mkdir(parents=True, exist_ok=True)
         artifact = {
-            "schema_version": "q1.uniform_768.v1",
+            "schema_version": "q1.uniform_768.v6",
             "model_profile": config.get("model_profile", "uniform_768_reproducible"),
             "config_hash": config.config_hash,
             "id": [entry["id"] for entry in manifest],
             "text": text_stack.astype(np.float16),
+            "text_semantic_available": np.asarray(
+                [item["text_semantic_available"] for item in results], dtype=np.uint8
+            ),
             "audio": audio_stack.astype(np.float16),
             "vision": vision_stack.astype(np.float16),
             "auxiliary": {
@@ -918,11 +1045,15 @@ def run_pipeline(
             },
             "masks": {
                 "text": text_masks.astype(np.uint8),
+                "text_reliable": np.stack([item["text_reliable_mask"] for item in results]).astype(np.uint8),
                 "audio": audio_masks.astype(np.uint8),
                 "vision": vision_masks.astype(np.uint8),
             },
             "text_confidence": np.stack([item["text_confidence"] for item in results]).astype(np.float32),
             "text_low_confidence_mask": np.stack([item["text_low_confidence_mask"] for item in results]).astype(np.uint8),
+            "vision_quality_aligned": np.stack([item["vision_quality_aligned"] for item in results]).astype(np.float32),
+            "vision_weight_sum": np.stack([item["vision_weight_sum"] for item in results]).astype(np.float32),
+            "alignment_quality": [item["alignment_quality"] for item in results],
             "durations": np.asarray([item["duration"] for item in results], dtype=np.float32),
             "duration_alignment": np.asarray([item["duration_alignment"] for item in results], dtype=np.float32),
             "duration_container": np.asarray([item["duration_container"] for item in results], dtype=np.float32),
@@ -990,6 +1121,7 @@ def run_pipeline(
                     "feature_dim_vision": 768,
                     "aligned_length": config.aligned_length,
                     "alignment_granularity": "proportional_50_half_open_intervals",
+                    "text_semantic_available": result["stats"]["text_semantic_available"],
                     "feature_status": result["processing_status"],
                     "processing_status": result["processing_status"],
                     "quality_status": result["quality_status"],
@@ -1003,6 +1135,10 @@ def run_pipeline(
                     "text_fallback_count": result["stats"]["text_fallback_count"],
                     "text_fallback_ratio": result["stats"]["text_fallback_ratio"],
                     "text_word_count": result["stats"]["text_word_count"],
+                    "text_timestamp_valid_word_count": result["stats"]["text_timestamp_valid_word_count"],
+                    "text_matched_word_count": result["stats"]["text_matched_word_count"],
+                    "text_reliable_word_count": result["stats"]["text_reliable_word_count"],
+                    "text_reliable_ratio": result["stats"]["text_reliable_ratio"],
                     "text_asr_word_count": result["stats"]["text_asr_word_count"],
                     "text_invalid_timestamp_count": result["stats"]["text_invalid_timestamp_count"],
                     "text_low_confidence_ratio": result["stats"]["text_low_confidence_ratio"],
@@ -1013,6 +1149,17 @@ def run_pipeline(
                     "text_asr_retry_selected": result["stats"]["text_asr_retry_selected"],
                     "text_asr_selected_profile": result["stats"]["text_asr_selected_profile"],
                     "text_asr_attempt_count": result["stats"]["text_asr_attempt_count"],
+                    "audio_raw_frame_count": result["stats"]["audio_raw_frame_count"],
+                    "audio_valid_raw_frame_count": result["stats"]["audio_valid_raw_frame_count"],
+                    "audio_raw_valid_ratio": result["stats"]["audio_raw_valid_ratio"],
+                    "audio_aligned_valid_bins": result["valid_lengths"]["audio"],
+                    "vision_raw_frame_count": result["stats"]["vision_raw_frame_count"],
+                    "vision_valid_raw_frame_count": result["stats"]["vision_valid_raw_frame_count"],
+                    "vision_raw_valid_ratio": result["stats"]["vision_raw_valid_ratio"],
+                    "vision_aligned_valid_bins": result["valid_lengths"]["vision"],
+                    "trimodal_temporal_alignment_score": result["alignment_quality"]["trimodal_temporal_alignment_score"],
+                    "joint_support_bins": result["alignment_quality"]["joint_support_bins"],
+                    "alignment_status": result["alignment_quality"]["alignment_status"],
                     "failure_reason": result["failure_reason"],
                 }
             )
@@ -1050,13 +1197,17 @@ def run_pipeline(
             "duration_endpoint_explanation",
             "audio_sample_rate_original", "video_fps", "video_width", "video_height", "text_length", "audio_length",
             "vision_length", "feature_dim_text", "feature_dim_audio", "feature_dim_vision", "aligned_length",
-            "alignment_granularity", "feature_status", "processing_status", "quality_status", "text_status",
+            "alignment_granularity", "text_semantic_available", "feature_status", "processing_status", "quality_status", "text_status",
             "audio_status", "vision_status", "vision_failure_reason", "vision_valid_ratio",
             "vision_face_detection_ratio", "vision_imputed_ratio", "text_fallback_count", "text_fallback_ratio",
-            "text_word_count", "text_asr_word_count", "text_invalid_timestamp_count",
+            "text_word_count", "text_timestamp_valid_word_count", "text_matched_word_count", "text_reliable_word_count",
+            "text_reliable_ratio", "text_asr_word_count", "text_invalid_timestamp_count",
             "text_low_confidence_ratio", "text_timestamp_source", "failure_reason", "sha256",
             "text_lexical_asr_word_count", "text_review_status", "text_asr_retry_used",
             "text_asr_retry_selected", "text_asr_selected_profile", "text_asr_attempt_count",
+            "audio_raw_frame_count", "audio_valid_raw_frame_count", "audio_raw_valid_ratio", "audio_aligned_valid_bins",
+            "vision_raw_frame_count", "vision_valid_raw_frame_count", "vision_raw_valid_ratio", "vision_aligned_valid_bins",
+            "trimodal_temporal_alignment_score", "joint_support_bins", "alignment_status",
         ]
         write_csv(manifest_rows, submission_dir / "manifest.csv", manifest_fields)
         alignment_fields = sorted({key for row in alignment_rows for key in row})
@@ -1130,6 +1281,120 @@ def run_pipeline(
             "duration_endpoint_explanation",
         ]
         write_csv(manifest_rows, submission_dir / "duration_audit.csv", duration_fields)
+
+        effective_length_rows: list[dict[str, Any]] = []
+        quality_records: list[dict[str, Any]] = []
+        for entry, result in zip(manifest, results):
+            stats = result["stats"]
+            effective_row = {
+                "id": entry["id"],
+                "text_raw_words": int(stats.get("text_word_count", 0)),
+                "text_timestamp_valid_words": int(stats.get("text_timestamp_valid_word_count", 0)),
+                "text_matched_words": int(stats.get("text_matched_word_count", 0)),
+                "text_reliable_word_count": int(stats.get("text_reliable_word_count", 0)),
+                "text_raw_valid_ratio": float(stats.get("text_reliable_word_count", 0) / max(int(stats.get("text_word_count", 0)), 1)),
+                "text_timestamp_valid_ratio": float(stats.get("text_timestamp_valid_word_count", 0) / max(int(stats.get("text_word_count", 0)), 1)),
+                "text_aligned_valid_bins": int(result["valid_lengths"]["text"]),
+                "text_aligned_valid_ratio": float(result["valid_lengths"]["text"] / max(config.aligned_length, 1)),
+                "audio_raw_frames": int(stats.get("audio_raw_frame_count", 0)),
+                "audio_valid_raw_frames": int(stats.get("audio_valid_raw_frame_count", 0)),
+                "audio_raw_valid_ratio": float(stats.get("audio_raw_valid_ratio", 0.0)),
+                "audio_aligned_valid_bins": int(result["valid_lengths"]["audio"]),
+                "audio_aligned_valid_ratio": float(result["valid_lengths"]["audio"] / max(config.aligned_length, 1)),
+                "vision_raw_frames": int(stats.get("vision_raw_frame_count", 0)),
+                "vision_valid_raw_frames": int(stats.get("vision_valid_raw_frame_count", 0)),
+                "vision_raw_valid_ratio": float(stats.get("vision_raw_valid_ratio", 0.0)),
+                "vision_aligned_valid_bins": int(result["valid_lengths"]["vision"]),
+                "vision_aligned_valid_ratio": float(result["valid_lengths"]["vision"] / max(config.aligned_length, 1)),
+                "quality_status": result["quality_status"],
+                "text_review_status": stats.get("text_review_status", ""),
+                "vision_status": result["vision_status"],
+            }
+            effective_length_rows.append(effective_row)
+            quality_records.append(
+                {
+                    "id": entry["id"],
+                    **result.get("alignment_quality", {}),
+                }
+            )
+        effective_fields = list(effective_length_rows[0].keys()) if effective_length_rows else []
+        write_csv(effective_length_rows, submission_dir / "effective_length_summary.csv", effective_fields)
+        quality_fields = sorted(
+            {
+                key
+                for row in quality_records
+                for key in row
+                if key != "values"
+            }
+        )
+        write_csv(
+            [{key: row.get(key) for key in quality_fields} for row in quality_records],
+            submission_dir / "alignment_quality.csv",
+            quality_fields,
+        )
+        quality_summary = aggregate_alignment_quality(quality_records)
+        write_json(
+            {
+                "schema_version": "q1.alignment_quality.v3",
+                "sample_count": len(manifest),
+                "metric": "trimodal_temporal_alignment_score",
+                "alignment_quality": quality_summary,
+                "effective_length_mean": {
+                    key: float(np.mean([float(row[key]) for row in effective_length_rows]))
+                    for key in effective_fields
+                    if key != "id" and all(isinstance(row.get(key), (int, float)) for row in effective_length_rows)
+                },
+                "figure_names": [
+                    "图1_三模态时序对齐质量概览.png",
+                    "图2_标签与特征维度概览.png",
+                    "图3a_典型样本文本位置热力图.png",
+                    "图3b_典型样本三模态特征响应.png",
+                    "图4_三模态对齐分数与有效覆盖率.png",
+                    "图5_特征文件存储规范.png",
+                ],
+            },
+            audit_dir / "alignment_quality_summary.json",
+        )
+        report_quality = np.minimum.reduce([text_masks.mean(axis=1), audio_masks.mean(axis=1), vision_masks.mean(axis=1)])
+        if len(report_quality):
+            finite_quality = report_quality[np.isfinite(report_quality)]
+            target_quality = float(np.median(finite_quality)) if finite_quality.size else 0.0
+            text_word_counts = np.asarray(
+                [float(item["stats"].get("text_word_count", 0)) for item in results],
+                dtype=np.float64,
+            )
+            finite_word_counts = text_word_counts[np.isfinite(text_word_counts)]
+            target_word_count = float(np.median(finite_word_counts)) if finite_word_counts.size else 0.0
+            word_scale = max(target_word_count, 1.0)
+            selection_score = np.abs(report_quality - target_quality) + 0.50 * (
+                np.abs(text_word_counts - target_word_count) / word_scale
+            )
+            report_selected_index = int(np.nanargmin(selection_score))
+        else:
+            report_selected_index = 0
+        report_figure_paths = render_quality_reports(
+            audit_dir / "figures",
+            manifest=manifest,
+            raw_audits=audit_results,
+            grids=artifact["time_grid"],
+            text_stack=artifact["text"],
+            audio_stack=artifact["audio"],
+            vision_stack=artifact["vision"],
+            masks=artifact["masks"],
+            effective_rows=effective_length_rows,
+            quality_records=quality_records,
+            labels=artifact["labels"],
+            selected_index=report_selected_index,
+            feature_dims={"text": 768, "audio": 768, "vision": 768},
+        )
+        write_json(
+            {
+                "figure_paths": {key: str(Path(value).relative_to(audit_dir)) for key, value in report_figure_paths.items()},
+                "selected_index": report_selected_index,
+                "selected_id": manifest[report_selected_index]["id"] if manifest else "",
+            },
+            audit_dir / "result_figures.json",
+        )
 
         if bool(config.get("save_unaligned", True)):
             atomic_pickle_dump({"schema_version": "q1.unaligned.v1", "samples": audit_results}, audit_dir / "q1_unaligned.pkl")
@@ -1233,56 +1498,70 @@ def run_pipeline(
         if validation["errors"]:
             raise RuntimeError("Output validation failed: " + "; ".join(validation["errors"]))
 
-        zip_path = run_dir / "outputs" / f"q1_submission_{run_id}.zip"
-        zip_bytes = _build_submission_zip(
-            run_dir,
-            submission_dir,
-            audit_dir,
-            run_dir / "environment",
-            config,
-            run_id,
-            zip_path,
-        )
-        package_report = validate_submission_package(zip_path, PACKAGE_REQUIRED_PATHS)
-        validation["package"] = package_report
-        validation["conclusions"]["reproducibility_package"] = "passed" if not package_report["errors"] else "failed"
-        validation["conclusions"]["overall"] = (
-            "passed_with_quality_conditions"
-            if validation["conclusions"].get("structure") == "passed" and not package_report["errors"]
-            else "blocked"
-        )
-        validation["errors"].extend(package_report["errors"])
-        validation["warnings"].extend(package_report["warnings"])
-        write_json(validation, submission_dir / "validation_report.json")
-        if validation["errors"]:
-            raise RuntimeError("Submission package validation failed: " + "; ".join(validation["errors"]))
+        build_submission_package = bool(config.get("build_submission_package", False))
+        zip_path: Path | None = None
+        zip_bytes: int | None = None
+        if build_submission_package:
+            zip_path = run_dir / "outputs" / f"q1_submission_{run_id}.zip"
+            zip_bytes = _build_submission_zip(
+                run_dir,
+                submission_dir,
+                audit_dir,
+                run_dir / "environment",
+                config,
+                run_id,
+                zip_path,
+            )
+            package_report = validate_submission_package(zip_path, PACKAGE_REQUIRED_PATHS)
+            validation["package"] = package_report
+            validation["conclusions"]["reproducibility_package"] = "passed" if not package_report["errors"] else "failed"
+            validation["conclusions"]["overall"] = (
+                "passed_with_quality_conditions"
+                if validation["conclusions"].get("structure") == "passed" and not package_report["errors"]
+                else "blocked"
+            )
+            validation["errors"].extend(package_report["errors"])
+            validation["warnings"].extend(package_report["warnings"])
+            write_json(validation, submission_dir / "validation_report.json")
+            if validation["errors"]:
+                raise RuntimeError("Submission package validation failed: " + "; ".join(validation["errors"]))
 
-        # Rebuild so the final archive contains the final validation report.
-        zip_bytes = _build_submission_zip(
-            run_dir,
-            submission_dir,
-            audit_dir,
-            run_dir / "environment",
-            config,
-            run_id,
-            zip_path,
-        )
-        final_package_report = validate_submission_package(zip_path, PACKAGE_REQUIRED_PATHS)
-        if final_package_report["errors"]:
-            raise RuntimeError("Final submission package validation failed: " + "; ".join(final_package_report["errors"]))
-        write_json(
-            {
-                "uncompressed_submission_bytes": sum(path.stat().st_size for path in submission_dir.rglob("*") if path.is_file()),
-                "compressed_bytes": zip_bytes,
-                "limit_bytes": int(config.get("submission_max_bytes", 52_428_800)),
-                "within_limit": zip_bytes <= int(config.get("submission_max_bytes", 52_428_800)),
-                "package_file_count": final_package_report["file_count"],
-                "required_paths": PACKAGE_REQUIRED_PATHS,
-            },
-            submission_dir / "package_size.json",
-        )
-        if zip_bytes > int(config.get("submission_max_bytes", 52_428_800)):
-            raise RuntimeError(f"Submission archive exceeds limit: {zip_bytes} bytes")
+            # Rebuild so the final archive contains the final validation report.
+            zip_bytes = _build_submission_zip(
+                run_dir,
+                submission_dir,
+                audit_dir,
+                run_dir / "environment",
+                config,
+                run_id,
+                zip_path,
+            )
+            final_package_report = validate_submission_package(zip_path, PACKAGE_REQUIRED_PATHS)
+            if final_package_report["errors"]:
+                raise RuntimeError("Final submission package validation failed: " + "; ".join(final_package_report["errors"]))
+            write_json(
+                {
+                    "uncompressed_submission_bytes": sum(path.stat().st_size for path in submission_dir.rglob("*") if path.is_file()),
+                    "compressed_bytes": zip_bytes,
+                    "limit_bytes": int(config.get("submission_max_bytes", 52_428_800)),
+                    "within_limit": zip_bytes <= int(config.get("submission_max_bytes", 52_428_800)),
+                    "package_file_count": final_package_report["file_count"],
+                    "required_paths": PACKAGE_REQUIRED_PATHS,
+                },
+                submission_dir / "package_size.json",
+            )
+            if zip_bytes > int(config.get("submission_max_bytes", 52_428_800)):
+                raise RuntimeError(f"Submission archive exceeds limit: {zip_bytes} bytes")
+        else:
+            validation["package"] = None
+            validation["conclusions"]["reproducibility_package"] = "not_requested"
+            validation["conclusions"]["overall"] = (
+                "passed_with_quality_conditions_no_package"
+                if validation["conclusions"].get("structure") == "passed"
+                else "blocked"
+            )
+            validation["warnings"].append("Submission package was not generated for this intermediate run")
+            write_json(validation, submission_dir / "validation_report.json")
 
         elapsed = time.time() - started
         logger.info("Run complete: successful=%d failed=%d elapsed=%.1fs", completed, failures, elapsed)
@@ -1294,7 +1573,9 @@ def run_pipeline(
                 "successful_samples": completed,
                 "failed_samples": failures,
                 "elapsed_seconds": elapsed,
-                "submission_zip": str(zip_path),
+                "submission_zip": str(zip_path) if zip_path is not None else None,
+                "package_generated": build_submission_package,
+                "report_figures_generated": True,
             },
             run_dir / "run_summary.json",
         )
@@ -1316,8 +1597,11 @@ def main() -> None:
     parser.add_argument("--sample-id")
     parser.add_argument("--allow-failures", action="store_true")
     parser.add_argument("--skip-model-hash", action="store_true")
+    parser.add_argument("--build-package", action="store_true", help="Build the final submission archive after all reports pass")
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.build_package:
+        config.values["build_submission_package"] = True
     run_pipeline(
         config,
         args.run_id,

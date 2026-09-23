@@ -1,0 +1,12 @@
+base_config: q2_ablation_base.yaml
+code_version: q2_ablation_full_auxiliary
+# Replace the simplified objective with the complete auxiliary-loss package.
+lambda_regression: 1.0
+lambda_consistency: 0.03
+lambda_repr_consistency: 0.05
+lambda_reconstruction: 0.05
+lambda_mofe: 0.05
+lambda_modality_aux: 0.05
+lambda_neutral_aux: 0.05
+reconstruction_enabled: true
+modality_auxiliary_enabled: true

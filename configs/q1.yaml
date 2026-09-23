@@ -22,6 +22,9 @@ text_match_max_edit_ratio: 0.40
 text_fallback_confidence: 0.20
 text_fallback_min_interval_s: 0.01
 text_low_confidence_threshold: 0.50
+trimodal_audio_rms_quantile_low: 0.10
+trimodal_audio_rms_quantile_high: 0.90
+trimodal_min_joint_support_bins: 3
 asr_retry_enabled: true
 asr_retry_min_fallback_ratio: 0.50
 asr_retry_num_beams: 3
@@ -84,6 +87,8 @@ submission_max_bytes: 52428800
 q1_unaligned_role: local_audit_only
 trust_remote_code: false
 random_seed: 2026
+generate_quality_reports: true
+build_submission_package: false
 python_version: 3.10.21
 torch_version: 2.5.1+cu121
 transformers_version: 4.48.3

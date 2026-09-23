@@ -1,0 +1,4 @@
+base_config: q2_ablation_base.yaml
+code_version: q2_ablation_no_earlystop
+# Isolate early stopping: keep the recommended model and losses.
+early_stopping_patience: 12

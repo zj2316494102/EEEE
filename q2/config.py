@@ -65,6 +65,8 @@ class Q2Config:
             "fusion",
             "use_transformer",
             "use_coverage_features",
+            "reconstruction_enabled",
+            "modality_auxiliary_enabled",
             "hidden_dim",
             "expert_dim",
             "v2_hidden_dim",
@@ -87,7 +89,16 @@ def load_config(path: str | Path) -> Q2Config:
         values = yaml.safe_load(handle) or {}
     if not isinstance(values, Mapping):
         raise ValueError(f"Configuration root must be a mapping: {config_path}")
-    return Q2Config(dict(values), config_path)
+    values = dict(values)
+    base_config = values.pop("base_config", None)
+    if base_config:
+        base_path = Path(base_config)
+        if not base_path.is_absolute():
+            base_path = config_path.parent / base_path
+        base_values = load_config(base_path).values
+        base_values.update(values)
+        values = base_values
+    return Q2Config(values, config_path)
 
 
 def dump_yaml(values: Mapping[str, Any], path: str | Path) -> None:

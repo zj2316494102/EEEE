@@ -1,0 +1,5 @@
+base_config: q2_ablation_base.yaml
+code_version: q2_ablation_no_regularization
+# Isolate the regularization strategy: keep every other recommended component.
+dropout: 0.15
+weight_decay: 0.0001

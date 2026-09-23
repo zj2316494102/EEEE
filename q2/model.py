@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Any, Mapping
 
 import torch
 from torch import Tensor, nn
@@ -44,14 +44,24 @@ class RobustGatedTemporalFusion(nn.Module):
         fusion: str = "dynamic",
         use_transformer: bool = True,
         use_coverage_features: bool = True,
+        reconstruction_enabled: bool = False,
+        modality_auxiliary_enabled: bool = False,
     ) -> None:
         super().__init__()
         if len(input_dims) != 3:
             raise ValueError("input_dims must contain text, audio and vision dimensions")
         if projection_dim % attention_heads != 0:
             raise ValueError("projection_dim must be divisible by attention_heads")
-        if fusion not in {"dynamic", "mean"}:
-            raise ValueError("fusion must be 'dynamic' or 'mean'")
+        fusion_aliases = {
+            "dynamic": "dynamic",
+            "attention": "dynamic",
+            "mean": "mean",
+            "fixed": "mean",
+            "concat": "concat",
+        }
+        fusion_key = str(fusion).lower()
+        if fusion_key not in fusion_aliases:
+            raise ValueError("fusion must be one of: attention, dynamic, fixed, mean, concat")
         self.input_dims = tuple(int(value) for value in input_dims)
         self.max_length = int(max_length)
         self.projection_dim = int(projection_dim)
@@ -60,9 +70,11 @@ class RobustGatedTemporalFusion(nn.Module):
         self.feedforward_dim = int(feedforward_dim)
         self.dropout = float(dropout)
         self.use_mask_input = bool(use_mask_input)
-        self.fusion = fusion
+        self.fusion = fusion_aliases[fusion_key]
         self.use_transformer = bool(use_transformer)
         self.use_coverage_features = bool(use_coverage_features)
+        self.reconstruction_enabled = bool(reconstruction_enabled)
+        self.modality_auxiliary_enabled = bool(modality_auxiliary_enabled)
 
         self.projections = nn.ModuleDict(
             {
@@ -75,7 +87,7 @@ class RobustGatedTemporalFusion(nn.Module):
             }
         )
         self.gate_scores = nn.ModuleDict(
-            {modality: nn.Linear(projection_dim, 1) for modality in MODALITIES}
+            {modality: nn.Linear(projection_dim + 3, 1) for modality in MODALITIES}
         )
         self.position_embedding = nn.Parameter(torch.zeros(1, self.max_length, projection_dim))
         self.modality_embedding = nn.Parameter(torch.zeros(len(MODALITIES), projection_dim))
@@ -84,8 +96,9 @@ class RobustGatedTemporalFusion(nn.Module):
 
         state_dim = projection_dim // 4 if use_mask_input else 0
         self.state_embedding = nn.Embedding(8, max(state_dim, 1))
+        fusion_input_dim = projection_dim * len(MODALITIES) if self.fusion == "concat" else projection_dim
         self.fusion_projection = nn.Sequential(
-            nn.Linear(projection_dim + state_dim, projection_dim),
+            nn.Linear(fusion_input_dim + state_dim, projection_dim),
             nn.LayerNorm(projection_dim),
             nn.GELU(),
         )
@@ -131,6 +144,23 @@ class RobustGatedTemporalFusion(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(projection_dim // 2, 1),
         )
+        self.reconstruction_heads = nn.ModuleDict(
+            {
+                modality: nn.Sequential(
+                    nn.Linear(projection_dim, projection_dim),
+                    nn.GELU(),
+                    nn.Linear(projection_dim, input_dim),
+                )
+                for modality, input_dim in zip(MODALITIES, self.input_dims)
+            }
+            if self.reconstruction_enabled
+            else {}
+        )
+        self.modality_auxiliary_heads = nn.ModuleDict(
+            {modality: nn.Linear(projection_dim, 3) for modality in MODALITIES}
+            if self.modality_auxiliary_enabled
+            else {}
+        )
 
     def config_dict(self) -> dict[str, object]:
         return {
@@ -145,6 +175,8 @@ class RobustGatedTemporalFusion(nn.Module):
             "fusion": self.fusion,
             "use_transformer": self.use_transformer,
             "use_coverage_features": self.use_coverage_features,
+            "reconstruction_enabled": self.reconstruction_enabled,
+            "modality_auxiliary_enabled": self.modality_auxiliary_enabled,
         }
 
     def _coerce_masks(self, masks: Mapping[str, Tensor] | Tensor, device: torch.device) -> Tensor:
@@ -176,11 +208,15 @@ class RobustGatedTemporalFusion(nn.Module):
         self,
         features: Mapping[str, Tensor],
         masks: Mapping[str, Tensor] | Tensor,
-    ) -> dict[str, Tensor]:
+    ) -> dict[str, Any]:
         device = next(self.parameters()).device
         mask_tensor = self._coerce_masks(masks, device)
         feature_tensors = self._coerce_features(features, device)
         network_masks = mask_tensor if self.use_mask_input else torch.ones_like(mask_tensor)
+        coverage = network_masks.float().mean(dim=2)
+        longest_missing = torch.stack(
+            [_longest_missing_run(network_masks[:, index]) for index in range(3)], dim=1
+        )
         hidden: list[Tensor] = []
         scores: list[Tensor] = []
         for index, (modality, values) in enumerate(zip(MODALITIES, feature_tensors)):
@@ -190,20 +226,38 @@ class RobustGatedTemporalFusion(nn.Module):
             encoded = encoded + self.position_embedding[:, : self.max_length]
             encoded = encoded + self.modality_embedding[index].view(1, 1, -1)
             hidden.append(encoded)
-            scores.append(self.gate_scores[modality](encoded).squeeze(-1))
+            quality = torch.stack(
+                [
+                    network_masks[:, index].float(),
+                    coverage[:, index].unsqueeze(1).expand(-1, self.max_length),
+                    (1.0 - longest_missing[:, index]).unsqueeze(1).expand(-1, self.max_length),
+                ],
+                dim=-1,
+            )
+            scores.append(
+                self.gate_scores[modality](torch.cat([encoded, quality], dim=-1)).squeeze(-1)
+            )
 
         hidden_stack = torch.stack(hidden, dim=2)  # [B, T, M, D]
         available = network_masks.permute(0, 2, 1)  # [B, T, M]
         if self.fusion == "mean":
             weights = available.to(hidden_stack.dtype)
             weights = weights / weights.sum(dim=2, keepdim=True).clamp_min(1.0)
+            fused = (hidden_stack * weights.unsqueeze(-1)).sum(dim=2)
+        elif self.fusion == "concat":
+            # F1: concatenate the three projected streams.  Invalid streams
+            # are already zeroed, while the availability code is appended
+            # below so the MLP can distinguish zero from missing.
+            weights = available.to(hidden_stack.dtype)
+            weights = weights / weights.sum(dim=2, keepdim=True).clamp_min(1.0)
+            fused = hidden_stack.reshape(hidden_stack.shape[0], hidden_stack.shape[1], -1)
         else:
             score_stack = torch.stack(scores, dim=2)
             masked_scores = score_stack.masked_fill(~available, -1e4)
             shifted = masked_scores - masked_scores.max(dim=2, keepdim=True).values
             weights = torch.exp(shifted) * available.to(shifted.dtype)
             weights = weights / weights.sum(dim=2, keepdim=True).clamp_min(1e-8)
-        fused = (hidden_stack * weights.unsqueeze(-1)).sum(dim=2)
+            fused = (hidden_stack * weights.unsqueeze(-1)).sum(dim=2)
 
         state_code = (
             network_masks[:, 0].long()
@@ -236,17 +290,13 @@ class RobustGatedTemporalFusion(nn.Module):
             pooled = pooled.clone()
             pooled[all_unavailable] = self.fallback_state
 
-        coverage = network_masks.float().mean(dim=2)
-        longest_missing = torch.stack(
-            [_longest_missing_run(network_masks[:, index]) for index in range(3)], dim=1
-        )
         head_input = pooled
         if self.use_coverage_features:
             head_input = torch.cat([head_input, coverage, longest_missing], dim=-1)
         logits = self.classification_head(head_input)
         neutral_aux_logit = self.neutral_aux_head(head_input).squeeze(-1)
         intensity = 3.0 * torch.tanh(self.regression_head(head_input).squeeze(-1))
-        return {
+        output = {
             "logits": logits,
             "probabilities": torch.softmax(logits, dim=-1),
             "intensity": intensity,
@@ -257,7 +307,31 @@ class RobustGatedTemporalFusion(nn.Module):
             "longest_missing": longest_missing,
             "all_unavailable": all_unavailable,
             "position_available": position_available,
+            "quality_features": torch.stack(
+                [coverage, 1.0 - longest_missing, network_masks.any(dim=2).float()], dim=-1
+            ),
         }
+        if self.modality_auxiliary_enabled:
+            modality_representations = []
+            for index in range(len(MODALITIES)):
+                modality_mask = network_masks[:, index].unsqueeze(-1)
+                denominator = modality_mask.sum(dim=1).clamp_min(1).to(hidden_stack.dtype)
+                modality_representations.append(
+                    (hidden_stack[:, :, index] * modality_mask).sum(dim=1) / denominator
+                )
+            output["modality_logits"] = torch.stack(
+                [
+                    self.modality_auxiliary_heads[modality](modality_representations[index])
+                    for index, modality in enumerate(MODALITIES)
+                ],
+                dim=1,
+            )
+        if self.reconstruction_enabled:
+            output["reconstruction"] = {
+                modality: self.reconstruction_heads[modality](encoded)
+                for modality in MODALITIES
+            }
+        return output
 
 
 class RobustLateFusionV2(nn.Module):
@@ -546,4 +620,6 @@ def build_model(config: Mapping[str, object] | None = None) -> RobustGatedTempor
         fusion=str(values.get("fusion", "dynamic")),
         use_transformer=bool(values.get("use_transformer", True)),
         use_coverage_features=bool(values.get("use_coverage_features", True)),
+        reconstruction_enabled=bool(values.get("reconstruction_enabled", False)),
+        modality_auxiliary_enabled=bool(values.get("modality_auxiliary_enabled", False)),
     )

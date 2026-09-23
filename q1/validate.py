@@ -425,6 +425,42 @@ def validate_artifact(
             errors.append(f"{key} shape {array.shape} != {(n, 50, expected_dim)}")
         if not np.isfinite(array).all():
             errors.append(f"{key} contains NaN or infinity")
+    if "text_bert" in artifact:
+        errors.append("Deprecated Question 1 field text_bert must not be present")
+    text_semantic_available = np.asarray(artifact.get("text_semantic_available", []))
+    if text_semantic_available.shape != (n,):
+        errors.append(f"text_semantic_available shape {text_semantic_available.shape} != {(n,)}")
+    elif not np.isin(text_semantic_available, [0, 1]).all():
+        errors.append("text_semantic_available contains values other than 0/1")
+    alignment_quality = artifact.get("alignment_quality", [])
+    if not isinstance(alignment_quality, list) or len(alignment_quality) != n:
+        errors.append(f"alignment_quality length {len(alignment_quality) if isinstance(alignment_quality, list) else 'invalid'} != {n}")
+    else:
+        required_alignment_fields = {
+            "trimodal_temporal_alignment_score",
+            "joint_support_bins",
+            "alignment_status",
+        }
+        for index, record in enumerate(alignment_quality):
+            if not isinstance(record, dict) or not required_alignment_fields.issubset(record):
+                errors.append(f"alignment_quality record {index} is incomplete")
+                break
+            score = record.get("trimodal_temporal_alignment_score")
+            if score is not None:
+                try:
+                    score_value = float(score)
+                except (TypeError, ValueError):
+                    errors.append(f"alignment_quality record {index} has a non-numeric TMA score")
+                else:
+                    if not np.isfinite(score_value) or not 0.0 <= score_value <= 1.0:
+                        errors.append(f"alignment_quality record {index} TMA score is outside [0, 1]")
+            try:
+                joint_support = int(record.get("joint_support_bins"))
+            except (TypeError, ValueError):
+                errors.append(f"alignment_quality record {index} has an invalid joint_support_bins")
+            else:
+                if not 0 <= joint_support <= 50:
+                    errors.append(f"alignment_quality record {index} joint_support_bins is outside [0, 50]")
     masks = artifact.get("masks", {})
     for key in ("text", "audio", "vision"):
         if key not in masks:
@@ -435,6 +471,19 @@ def validate_artifact(
             errors.append(f"{key} mask shape {mask.shape} != {(n, 50)}")
         if not np.isin(mask, [0, 1]).all():
             errors.append(f"{key} mask contains values other than 0/1")
+    reliable_text_mask = np.asarray(masks.get("text_reliable", []))
+    if reliable_text_mask.shape != (n, 50):
+        errors.append(f"text_reliable mask shape {reliable_text_mask.shape} != {(n, 50)}")
+    elif not np.isin(reliable_text_mask, [0, 1]).all():
+        errors.append("text_reliable mask contains values other than 0/1")
+    for key in ("vision_quality_aligned", "vision_weight_sum"):
+        array = np.asarray(artifact.get(key, []))
+        if array.shape != (n, 50):
+            errors.append(f"{key} shape {array.shape} != {(n, 50)}")
+        elif not np.isfinite(array).all():
+            errors.append(f"{key} contains NaN or infinity")
+        elif np.any(array < 0):
+            errors.append(f"{key} contains negative values")
     durations = np.asarray(artifact.get("durations", []), dtype=np.float64)
     alignment_durations = np.asarray(artifact.get("duration_alignment", durations), dtype=np.float64)
     container_durations = np.asarray(artifact.get("duration_container", []), dtype=np.float64)

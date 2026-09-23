@@ -1,6 +1,7 @@
-# Question 2: aligned_50 multimodal robust prediction.
+# Controlled ablation base: all recommended anti-overfitting strategies enabled.
+# Each q2_ablation_*.yaml inherits this file and changes one factor at a time.
 feature_version: aligned_50
-code_version: q2_v6_full_drop03_2head_wd5e4
+code_version: q2_ablation_recommended
 max_length: 50
 input_dims: [768, 74, 35]
 aligned_feature_path: E题数据/附件2-数据集特征文件/aligned_50.pkl
@@ -9,66 +10,67 @@ attachment3_aligned_dir: E题数据/附件3-模态缺失特征样本/对齐版�
 run_root: runs
 test_evaluation_enabled: false
 
-# V6/full: V5 complete robustness model with stronger dropout/weight decay
-# and a two-head temporal Transformer. All main branches are explicit and
-# recorded in the effective configuration and checkpoint metadata.
+# V4-R0 style capacity and fusion structure.
 model_type: dynamic_gate
 projection_dim: 128
 transformer_layers: 2
-attention_heads: 2
+attention_heads: 4
 feedforward_dim: 256
-dropout: 0.30
+dropout: 0.20
 use_mask_input: true
-fusion: dynamic
+fusion: attention
 use_transformer: true
 use_coverage_features: true
-reconstruction_enabled: true
-modality_auxiliary_enabled: true
+reconstruction_enabled: false
+modality_auxiliary_enabled: false
 
-# Training.
+# Fixed low-learning-rate training protocol.
 optimizer: AdamW
 learning_rate: 0.0001
-weight_decay: 0.0005
+weight_decay: 0.0002
 batch_size: 64
-max_epochs: 100
-early_stopping_patience: 12
-lambda_regression: 1.0
-lambda_consistency: 0.03
-lambda_repr_consistency: 0.05
-lambda_reconstruction: 0.05
-lambda_mofe: 0.05
-lambda_modality_aux: 0.05
-lambda_neutral_aux: 0.05
+max_epochs: 40
+early_stopping_patience: 4
+lambda_regression: 0.1
+lambda_consistency: 0.0
+lambda_repr_consistency: 0.0
+lambda_reconstruction: 0.0
+lambda_mofe: 0.0
+lambda_modality_aux: 0.0
+lambda_neutral_aux: 0.0
 gradient_clip_norm: 1.0
 num_workers: 0
-use_class_weights: true
-class_weight_mode: sqrt_inverse
+use_class_weights: false
+class_weight_mode: none
 label_smoothing: 0.0
 focal_gamma: 0.0
+
+# Real curriculum: warm-up ends at epoch 4, robust phase ends at epoch 13.
 mask_augmentation_probability: 0.75
 mask_max_fraction: 0.60
 random_point_fraction: 0.20
 whole_modality_dropout_probability: 0.0
-text_whole_missing_probability: 0.20
+text_whole_missing_probability: 0.0
 augmentation_curriculum_enabled: true
-curriculum_warmup_fraction: 0.30
-curriculum_transfer_fraction: 0.70
+curriculum_warmup_fraction: 0.10
+curriculum_transfer_fraction: 0.33
 warmup_mask_augmentation_probability: 0.05
-robust_mask_augmentation_probability: 0.65
-transfer_mask_augmentation_probability: 0.65
+robust_mask_augmentation_probability: 0.25
+transfer_mask_augmentation_probability: 0.30
 warmup_mask_max_fraction: 0.10
-robust_mask_max_fraction: 0.60
-transfer_mask_max_fraction: 0.60
+robust_mask_max_fraction: 0.30
+transfer_mask_max_fraction: 0.30
+
 scheduler: cosine
 min_learning_rate: 0.000001
 
-# Full-model run: confidence-gated Teacher-Student distillation is enabled.
+# Low-weight, late-start, confidence-gated distillation.
 distillation_enabled: true
-distill_weight: 0.05
+distill_weight: 0.02
 distill_temperature: 2.0
 distill_regression_weight: 0.0
 distill_start_epoch: 5
-distill_ramp_epochs: 10
+distill_ramp_epochs: 5
 distill_confidence_gated: true
 distill_confidence_threshold: 0.70
 distill_confidence_scale: 0.30
@@ -82,5 +84,4 @@ validation_missing_fractions: [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70]
 validation_missing_positions: [front, middle, back]
 validation_missing_groups: [[0], [1], [2], [0, 1], [0, 2], [1, 2], [0, 1, 2]]
 validation_relation_modes: [overlap, stagger]
-# These are fixed mask-grid audit seeds, not model-training seeds.
 validation_mask_seeds: [2026, 42, 3407]

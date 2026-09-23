@@ -270,15 +270,37 @@ class AudioExtractor:
             centroid = librosa.feature.spectral_centroid(y=audio, sr=self.sample_rate, n_fft=frame_length, hop_length=hop_length, center=True)[0]
             zcr = librosa.feature.zero_crossing_rate(y=audio, frame_length=frame_length, hop_length=hop_length, center=True)[0]
             try:
-                f0 = librosa.yin(audio, fmin=50.0, fmax=500.0, sr=self.sample_rate, frame_length=frame_length, hop_length=hop_length, center=True)
+                f0, voiced_flag, _ = librosa.pyin(
+                    audio,
+                    fmin=50.0,
+                    fmax=500.0,
+                    sr=self.sample_rate,
+                    frame_length=frame_length,
+                    hop_length=hop_length,
+                    center=True,
+                )
+                voiced_flag = np.asarray(voiced_flag, dtype=bool)
             except Exception:
-                f0 = np.full_like(rms, np.nan, dtype=np.float32)
+                try:
+                    f0 = librosa.yin(
+                        audio,
+                        fmin=50.0,
+                        fmax=500.0,
+                        sr=self.sample_rate,
+                        frame_length=frame_length,
+                        hop_length=hop_length,
+                        center=True,
+                    )
+                    voiced_flag = np.isfinite(f0)
+                except Exception:
+                    f0 = np.full_like(rms, np.nan, dtype=np.float32)
+                    voiced_flag = np.zeros_like(rms, dtype=bool)
             frame_times = librosa.times_like(rms, sr=self.sample_rate, hop_length=hop_length)
             centers = spans.mean(axis=1)
             indices = np.clip(np.searchsorted(frame_times, centers), 0, len(frame_times) - 1)
             values[:, 0] = np.nan_to_num(f0[indices], nan=0.0, posinf=0.0, neginf=0.0)
             values[:, 1] = np.nan_to_num(rms[indices], nan=0.0, posinf=0.0, neginf=0.0)
-            values[:, 2] = (~np.isnan(f0[indices])).astype(np.float32)
+            values[:, 2] = np.asarray(voiced_flag[indices], dtype=np.float32)
             values[:, 3] = np.nan_to_num(centroid[indices], nan=0.0, posinf=0.0, neginf=0.0)
             values[:, 4] = np.nan_to_num(zcr[indices], nan=0.0, posinf=0.0, neginf=0.0)
             return values, valid.astype(np.uint8)

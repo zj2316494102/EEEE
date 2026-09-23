@@ -1,0 +1,10 @@
+base_config: q2_ablation_base.yaml
+code_version: q2_ablation_control
+# Control: remove the proposed anti-overfitting changes.
+dropout: 0.15
+weight_decay: 0.0001
+early_stopping_patience: 12
+augmentation_curriculum_enabled: false
+mask_augmentation_probability: 0.0
+text_whole_missing_probability: 0.0
+distillation_enabled: false

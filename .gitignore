@@ -36,6 +36,7 @@ models/
 tools/
 tests/
 tmp_docx_review_q2_source.docx
+tmp/
 
 # Local datasets and experiment results
 E题数据/

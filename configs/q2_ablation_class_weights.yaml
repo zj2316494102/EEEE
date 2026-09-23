@@ -1,0 +1,5 @@
+base_config: q2_ablation_base.yaml
+code_version: q2_ablation_class_weights
+# Isolate class reweighting for the imbalanced labels.
+use_class_weights: true
+class_weight_mode: sqrt_inverse

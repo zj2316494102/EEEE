@@ -18,6 +18,7 @@ import torch
 from . import MAX_LENGTH, MODALITIES
 from .baselines import ConcatMLP, restrict_to_modality
 from .config import Q2Config, dump_yaml, load_config
+from .checkpoint import atomic_torch_save
 from .data import (
     DatasetBundle,
     NormalizationStats,
@@ -116,36 +117,76 @@ def _select_device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
+def _with_text_whole_missing(
+    valid: SplitData,
+    scenarios: list[MaskScenario],
+    seed: int,
+) -> list[MaskScenario]:
+    """Append a reproducible whole-text pressure scenario without blanking samples."""
+
+    original = valid.mask_array()
+    masked = original.copy()
+    for sample_index in range(masked.shape[0]):
+        if not original[sample_index, 0].any():
+            continue
+        if original[sample_index, 1:, :].any():
+            masked[sample_index, 0] = False
+    scenarios.append(
+        MaskScenario(
+            name=f"text__whole__single__s{int(seed)}",
+            masks=masked,
+            missing_modalities=("text",),
+            fraction=1.0,
+            position="whole",
+            relation="single",
+            seed=int(seed),
+        )
+    )
+    return scenarios
+
+
 def _make_selection_scenarios(valid: SplitData, config: Q2Config, compact: bool) -> list[MaskScenario]:
     if compact:
-        return build_fixed_validation_scenarios(
-            valid.mask_array(),
-            fractions=(0.20, 0.40),
-            positions=("middle",),
-            groups=((0,), (1,), (2,), (0, 1, 2)),
-            relation_modes=("overlap",),
-            seeds=(int(config.get("random_seeds", [2026])[0]),),
+        return _with_text_whole_missing(
+            valid,
+            build_fixed_validation_scenarios(
+                valid.mask_array(),
+                fractions=(0.20, 0.40),
+                positions=("middle",),
+                groups=((0,), (1,), (2,), (0, 1, 2)),
+                relation_modes=("overlap",),
+                seeds=(int(config.get("random_seeds", [2026])[0]),),
+            ),
+            seed=int(config.get("random_seeds", [2026])[0]),
         )
-    return build_fixed_validation_scenarios(
-        valid.mask_array(),
-        fractions=tuple(float(item) for item in config.get("selection_missing_fractions", [0.20])),
-        positions=tuple(config.get("selection_missing_positions", ["middle"])),
-        groups=tuple(tuple(int(index) for index in group) for group in config.get("selection_missing_groups", [[0], [1], [2], [0, 1, 2]])),
-        relation_modes=tuple(config.get("selection_relation_modes", ["overlap"])),
-        seeds=(int(config.get("random_seeds", [2026])[0]),),
+    return _with_text_whole_missing(
+        valid,
+        build_fixed_validation_scenarios(
+            valid.mask_array(),
+            fractions=tuple(float(item) for item in config.get("selection_missing_fractions", [0.20])),
+            positions=tuple(config.get("selection_missing_positions", ["middle"])),
+            groups=tuple(tuple(int(index) for index in group) for group in config.get("selection_missing_groups", [[0], [1], [2], [0, 1, 2]])),
+            relation_modes=tuple(config.get("selection_relation_modes", ["overlap"])),
+            seeds=(int(config.get("random_seeds", [2026])[0]),),
+        ),
+        seed=int(config.get("random_seeds", [2026])[0]),
     )
 
 
 def _make_full_scenarios(valid: SplitData, config: Q2Config, compact: bool) -> list[MaskScenario]:
     if compact:
         return _make_selection_scenarios(valid, config, compact=True)
-    return build_fixed_validation_scenarios(
-        valid.mask_array(),
-        fractions=tuple(float(item) for item in config.get("validation_missing_fractions", [0.10, 0.20, 0.40, 0.60])),
-        positions=tuple(config.get("validation_missing_positions", ["front", "middle", "back"])),
-        groups=tuple(tuple(int(index) for index in group) for group in config.get("validation_missing_groups", [[0], [1], [2], [0, 1], [0, 2], [1, 2], [0, 1, 2]])),
-        relation_modes=tuple(config.get("validation_relation_modes", ["overlap", "stagger"])),
-        seeds=tuple(int(seed) for seed in config.get("validation_mask_seeds", [2026, 42, 3407])),
+    return _with_text_whole_missing(
+        valid,
+        build_fixed_validation_scenarios(
+            valid.mask_array(),
+            fractions=tuple(float(item) for item in config.get("validation_missing_fractions", [0.10, 0.20, 0.40, 0.60])),
+            positions=tuple(config.get("validation_missing_positions", ["front", "middle", "back"])),
+            groups=tuple(tuple(int(index) for index in group) for group in config.get("validation_missing_groups", [[0], [1], [2], [0, 1], [0, 2], [1, 2], [0, 1, 2]])),
+            relation_modes=tuple(config.get("validation_relation_modes", ["overlap", "stagger"])),
+            seeds=tuple(int(seed) for seed in config.get("validation_mask_seeds", [2026, 42, 3407])),
+        ),
+        seed=int(config.get("random_seeds", [2026])[0]),
     )
 
 
@@ -171,7 +212,7 @@ def _training_config(config: Q2Config, args: argparse.Namespace) -> dict[str, ob
 
 
 def _save_checkpoint(
-    model: RobustGatedTemporalFusion,
+    model: torch.nn.Module,
     path: Path,
     seed: int,
     bundle: DatasetBundle,
@@ -183,11 +224,11 @@ def _save_checkpoint(
         "state_dict": state,
         "seed": int(seed),
         "feature_version": config.feature_version,
+        "code_version": str(config.get("code_version", "unknown")),
         "label_mapping": bundle.label_mapping,
         "config_hash": config.config_hash,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(checkpoint, path)
+    atomic_torch_save(checkpoint, path)
 
 
 def _load_checkpoint(path: Path, device: torch.device) -> RobustGatedTemporalFusion:
@@ -267,6 +308,40 @@ def _mask_audit_rows(base_masks: np.ndarray, scenarios: list[MaskScenario]) -> l
     return rows
 
 
+def _missing_impact_rows(validation_rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Create the PDF-aligned type/position/duration impact table."""
+
+    rows = [dict(row) for row in validation_rows]
+    complete = next((row for row in rows if row.get("scenario") == "complete"), None)
+    if complete is None:
+        return []
+    complete_macro = float(complete.get("macro_f1", 0.0))
+    complete_accuracy = float(complete.get("accuracy", 0.0))
+    complete_neutral = float(complete.get("f1_neutral", 0.0))
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("scenario") == "complete":
+            continue
+        output.append(
+            {
+                "scenario": row.get("scenario"),
+                "missing_type": row.get("missing_modalities"),
+                "missing_position": row.get("missing_position"),
+                "missing_fraction": row.get("missing_fraction"),
+                "relation": row.get("relation"),
+                "mask_seed": row.get("mask_seed"),
+                "accuracy": row.get("accuracy"),
+                "macro_f1": row.get("macro_f1"),
+                "f1_neutral": row.get("f1_neutral"),
+                "mae": row.get("mae"),
+                "delta_accuracy_full_minus_missing": complete_accuracy - float(row.get("accuracy", 0.0)),
+                "delta_macro_f1_full_minus_missing": complete_macro - float(row.get("macro_f1", 0.0)),
+                "delta_neutral_f1_full_minus_missing": complete_neutral - float(row.get("f1_neutral", 0.0)),
+            }
+        )
+    return output
+
+
 def _run_ablations(
     train: SplitData,
     valid: SplitData,
@@ -283,7 +358,8 @@ def _run_ablations(
     variants = [
         ("no_contiguous_block_augmentation", {}, False, "contiguous"),
         ("random_point_augmentation", {}, True, "random_point"),
-        ("fixed_mean_fusion", {"fusion": "mean"}, True, "contiguous"),
+        ("fixed_weight_fusion", {"fusion": "fixed"}, True, "contiguous"),
+        ("concat_fusion", {"fusion": "concat"}, True, "contiguous"),
         ("no_explicit_mask_embedding", {"use_mask_input": False}, True, "contiguous"),
         ("no_temporal_transformer", {"use_transformer": False}, True, "contiguous"),
     ]
@@ -423,6 +499,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             {
                 "run_id": run_id,
                 "config_hash": config.config_hash,
+                "code_version": str(config.get("code_version", "unknown")),
                 "feature_version": config.feature_version,
                 "sample_limit": args.limit,
                 "created_at": datetime.now().isoformat(),
@@ -467,7 +544,9 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         train = stats.transform(bundle.train, name="train_normalized")
         valid = stats.transform(bundle.valid, name="valid_normalized")
         test = stats.transform(bundle.test, name="test_normalized")
-        save_normalization(stats, model_dir / "normalization.npz")
+        normalization_path = model_dir / "normalization.npz"
+        save_normalization(stats, normalization_path)
+        normalization_hash = sha256_file(normalization_path)
 
         train_config = _training_config(config, args)
         dump_yaml(train_config, output_dir / "config.yaml")
@@ -490,8 +569,11 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
         checkpoint_metadata = {
             "config_hash": config.config_hash,
+            "code_version": str(config.get("code_version", "unknown")),
             "feature_version": config.feature_version,
             "sample_limit": args.limit,
+            "input_file_sha256": input_hash,
+            "normalization_file_sha256": normalization_hash,
             "run_id": run_id,
         }
         seed_results: list[dict[str, Any]] = []
@@ -582,15 +664,28 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             device=device,
             batch_size=int(train_config.get("batch_size", 64)),
         )
-        test_metrics, _ = evaluate_split(
-            selected_result.model,
-            test,
-            device=device,
-            batch_size=int(train_config.get("batch_size", 64)),
+        evaluate_test = bool(
+            config.get("test_evaluation_enabled", False) or getattr(args, "evaluate_test", False)
         )
+        if evaluate_test:
+            test_metrics, _ = evaluate_split(
+                selected_result.model,
+                test,
+                device=device,
+                batch_size=int(train_config.get("batch_size", 64)),
+            )
+            baseline_test = majority_and_mean_baseline(test)
+        else:
+            test_metrics = {
+                "status": "not_evaluated",
+                "reason": "test metrics are withheld until the validation protocol is frozen",
+            }
+            baseline_test = {
+                "status": "not_evaluated",
+                "reason": "test baseline is withheld until the validation protocol is frozen",
+            }
         valid_complete = next(row for row in validation_rows if row["scenario"] == "complete")
         baseline_valid = majority_and_mean_baseline(valid)
-        baseline_test = majority_and_mean_baseline(test)
 
         model_path = model_dir / "robust_student.pt"
         _save_checkpoint(selected_result.model, model_path, selected_seed, bundle, config)
@@ -605,6 +700,10 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             ],
         )
         _write_csv(
+            validation_dir / "missing_impact_by_type_position_duration.csv",
+            _missing_impact_rows(validation_rows),
+        )
+        _write_csv(
             validation_dir / "confusion_matrix.csv",
             confusion_rows,
             fieldnames=["scenario", "true_class", "predicted_class", "count"],
@@ -617,7 +716,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
 
         ablation_rows = [
             {"variant": "majority_and_mean_baseline_valid", **baseline_valid},
-            {"variant": "robust_dynamic_gate_complete", **valid_complete},
+            {"variant": "robust_attention_gate_complete", **valid_complete},
         ]
         if args.run_ablations and not args.smoke:
             ablation_rows.extend(
@@ -660,6 +759,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             "status": "DONE",
             "resumed": resume_requested,
             "feature_version": config.feature_version,
+            "code_version": str(config.get("code_version", "unknown")),
             "feature_file": str(feature_path),
             "feature_file_sha256": input_hash,
             "label_file": None if label_path is None else str(label_path),
@@ -672,6 +772,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             "class_weights": class_weights.tolist(),
             "training_config": train_config,
             "distillation_enabled": use_distillation,
+            "test_evaluation_enabled": evaluate_test,
             "dataset_metadata": bundle.metadata,
             "sample_counts": {"train": train.size, "valid": valid.size, "test": test.size},
             "selected_validation_summary": aggregate_scenario_metrics(validation_rows),
@@ -695,6 +796,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             f"- selected_seed: `{selected_seed}`\n"
             f"- input mask rule: `{bundle.metadata['mask_ambiguity_note']}`\n"
             "- validation metrics are label-based; attachment 3 output has no accuracy claim.\n"
+            f"- labelled test evaluation enabled: `{evaluate_test}`; use it only after validation protocol freeze.\n"
             "- `robust_student.pt` is the inference checkpoint; resumable training checkpoints are under `../../checkpoints/`.\n"
         )
         (output_dir / "README.md").write_text(readme, encoding="utf-8")
@@ -703,6 +805,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             {
                 "run_id": run_id,
                 "config_hash": config.config_hash,
+                "code_version": str(config.get("code_version", "unknown")),
                 "feature_version": config.feature_version,
                 "sample_limit": args.limit,
                 "status": "DONE",
@@ -759,6 +862,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-ablations", action="store_true")
     parser.add_argument("--use-distillation", action="store_true", help="enable the optional teacher/student candidate")
     parser.add_argument("--no-distillation", action="store_true")
+    parser.add_argument(
+        "--evaluate-test",
+        action="store_true",
+        help="evaluate the labelled test split only after the validation protocol is frozen",
+    )
     parser.add_argument("--skip-attachment3", action="store_true")
     parser.add_argument("--skip-input-hash", action="store_true")
     return parser
