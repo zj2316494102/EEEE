@@ -60,6 +60,10 @@ video_decoder: ffmpeg
 video_decoder_version: ffmpeg 7.1.1
 video_timestamp_source: explicit_25fps_resampling
 video_output_fps: 25
+duration_endpoint_video_frame_count: 2
+duration_endpoint_video_min_tolerance_s: 0.10
+duration_endpoint_audio_tolerance_s: 0.25
+duration_endpoint_negative_tolerance_s: 0.02
 
 main_feature_dims: [768, 768, 768]
 q23_attachment2_dims: [768, 74, 35]

@@ -30,9 +30,11 @@ lambda_consistency: 0.05
 gradient_clip_norm: 1.0
 num_workers: 0
 use_class_weights: true
+class_weight_mode: sqrt_inverse
 mask_augmentation_probability: 0.75
 mask_max_fraction: 0.60
 random_point_fraction: 0.20
+whole_modality_dropout_probability: 0.0
 
 # Teacher/student is an explicitly optional candidate. It is disabled until
 # the same fixed validation matrix demonstrates a stable gain.
@@ -41,7 +43,7 @@ distill_weight: 0.20
 distill_temperature: 2.0
 distill_regression_weight: 0.5
 
-random_seeds: [2026, 42, 3407]
+random_seeds: [42]
 selection_missing_fractions: [0.20]
 selection_missing_positions: [middle]
 selection_missing_groups: [[0], [1], [2], [0, 1, 2]]
@@ -51,4 +53,3 @@ validation_missing_positions: [front, middle, back]
 validation_missing_groups: [[0], [1], [2], [0, 1], [0, 2], [1, 2], [0, 1, 2]]
 validation_relation_modes: [overlap, stagger]
 validation_mask_seeds: [2026, 42, 3407]
-

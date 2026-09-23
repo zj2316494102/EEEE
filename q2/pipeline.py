@@ -162,6 +162,10 @@ def _training_config(config: Q2Config, args: argparse.Namespace) -> dict[str, ob
         values["batch_size"] = args.batch_size
     if args.learning_rate is not None:
         values["learning_rate"] = args.learning_rate
+    if args.class_weight_mode is not None:
+        values["class_weight_mode"] = args.class_weight_mode
+    if args.whole_modality_dropout_probability is not None:
+        values["whole_modality_dropout_probability"] = args.whole_modality_dropout_probability
     return values
 
 
@@ -463,9 +467,10 @@ def run_pipeline(args: argparse.Namespace) -> Path:
         valid = stats.transform(bundle.valid, name="valid_normalized")
         test = stats.transform(bundle.test, name="test_normalized")
         save_normalization(stats, model_dir / "normalization.npz")
-        dump_yaml(config.values, output_dir / "config.yaml")
 
         train_config = _training_config(config, args)
+        dump_yaml(train_config, output_dir / "config.yaml")
+        dump_yaml(train_config, output_dir / "effective_config.yaml")
         model_config = _model_config(config)
         seeds = [int(seed) for seed in (args.seeds or config.get("random_seeds", [2026, 42, 3407]))]
         if args.smoke:
@@ -473,7 +478,9 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             train_config["max_epochs"] = min(int(train_config.get("max_epochs", 100)), 2)
             train_config["early_stopping_patience"] = min(int(train_config.get("early_stopping_patience", 12)), 2)
         class_weights = class_weights_from_training(
-            train, enabled=bool(config.get("use_class_weights", True))
+            train,
+            enabled=bool(config.get("use_class_weights", True)),
+            mode=str(train_config.get("class_weight_mode", "sqrt_inverse")),
         )
         selection_scenarios = _make_selection_scenarios(valid, config, compact=args.compact_validation or args.smoke)
         use_distillation = (bool(config.get("distillation_enabled", False)) or args.use_distillation) and not args.no_distillation
@@ -655,6 +662,7 @@ def run_pipeline(args: argparse.Namespace) -> Path:
             "selected_seed": selected_seed,
             "selected_best_epoch": selected_result.best_epoch,
             "class_weights": class_weights.tolist(),
+            "training_config": train_config,
             "distillation_enabled": use_distillation,
             "dataset_metadata": bundle.metadata,
             "sample_counts": {"train": train.size, "valid": valid.size, "test": test.size},
@@ -726,6 +734,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-epochs", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--learning-rate", type=float)
+    parser.add_argument(
+        "--class-weight-mode",
+        choices=("none", "sqrt_inverse", "inverse", "effective"),
+        help="override the training class-weight rule",
+    )
+    parser.add_argument(
+        "--whole-modality-dropout-probability",
+        type=float,
+        help="probability of dropping one complete modality per augmented sample",
+    )
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--smoke", action="store_true", help="short deterministic pipeline smoke run")
     parser.add_argument("--compact-validation", action="store_true")

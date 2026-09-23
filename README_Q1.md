@@ -40,7 +40,7 @@ python -m q1.pipeline --run-id 20260923_q1_001 --config configs/q1.yaml
 python -m q1.pipeline --run-id 20260923_q1_smoke --limit 1 --allow-failures --skip-model-hash
 ```
 
-运行完成后，只有出现 `results/问题1/<run_id>/DONE` 才下载结果。结果包括 `outputs/q1_submission/` 和 `outputs/q1_audit/`。
+运行完成后，只有出现 `results/问题1/<run_id>/DONE` 才下载结果。结果包括 `outputs/q1_submission/`、`outputs/q1_audit/` 和包含代码/环境/典型审计材料的 `outputs/q1_submission_<run_id>.zip`。
 
 ## 输出接口
 
@@ -61,7 +61,11 @@ python -m q1.validate \
   --artifact results/问题1/20260923_q1_001/outputs/q1_submission/q1_aligned_50.pkl \
   --manifest results/问题1/20260923_q1_001/outputs/q1_submission/manifest.csv \
   --raw-audit results/问题1/20260923_q1_001/outputs/q1_audit/q1_unaligned.pkl \
+  --alignment-log results/问题1/20260923_q1_001/outputs/q1_submission/alignment_log.csv \
+  --text-review results/问题1/20260923_q1_001/outputs/q1_submission/text_review.csv \
+  --duration-audit results/问题1/20260923_q1_001/outputs/q1_submission/duration_audit.csv \
+  --package-zip results/问题1/20260923_q1_001/outputs/q1_submission_20260923_q1_001.zip \
   --expected-count 100
 ```
 
-压缩包不包含模型权重、缓存、未对齐审计文件或身份信息。提交前检查 `package_size.json` 中的 `within_limit`。
+压缩包包含问题1核心代码、配置、环境快照、`tools/`运行入口、典型样本图/侧车和提交结果；不包含模型权重、缓存、源视频或完整未对齐审计文件。提交前检查 `package_size.json` 中的 `within_limit`。

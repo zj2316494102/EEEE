@@ -123,6 +123,38 @@ def generate_contiguous_block_masks(
     return output, records
 
 
+def apply_whole_modality_dropout(
+    base_masks: dict[str, np.ndarray] | np.ndarray,
+    rng: np.random.Generator,
+    probability: float = 0.0,
+    keep_at_least_one_modality: bool = True,
+) -> np.ndarray:
+    """Drop one complete modality for selected samples.
+
+    This is intentionally separate from contiguous time-block corruption. It
+    models a sample-level unavailable modality while preserving at least one
+    usable modality by default. The source mask is never mutated.
+    """
+
+    output = stack_masks(base_masks).copy()
+    probability = float(np.clip(probability, 0.0, 1.0))
+    if probability <= 0.0:
+        return output
+    for sample_index in range(output.shape[0]):
+        if float(rng.random()) >= probability:
+            continue
+        available = np.flatnonzero(output[sample_index].any(axis=1))
+        if len(available) == 0 or (keep_at_least_one_modality and len(available) <= 1):
+            continue
+        chosen = int(rng.choice(available))
+        candidate = output[sample_index].copy()
+        candidate[chosen] = False
+        if keep_at_least_one_modality and not candidate.any():
+            continue
+        output[sample_index] = candidate
+    return output
+
+
 def generate_random_point_masks(
     base_masks: dict[str, np.ndarray] | np.ndarray,
     rng: np.random.Generator,

@@ -162,6 +162,7 @@ def build_manifest(config: Q1Config, logger: logging.Logger) -> list[dict[str, A
             "sha256": sha256_file(video_path),
             "feature_status": "indexed",
         }
+        record.update(_duration_endpoint_audit(media, config))
         records.append(record)
     logger.info("Manifest validated: %d labels, %d videos, %d unique IDs", len(labels), len(video_map), len({x['id'] for x in records}))
     return records
@@ -169,6 +170,85 @@ def build_manifest(config: Q1Config, logger: logging.Logger) -> list[dict[str, A
 
 def _safe_name(sample_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", sample_id)
+
+
+def _duration_endpoint_audit(media: dict[str, Any], config: Q1Config) -> dict[str, Any]:
+    """Describe and validate the edit-list tail between alignment and decoding."""
+    alignment = float(media.get("duration_alignment", 0.0))
+    decoded_video = float(media.get("duration_decoded_video_end_pts", media.get("duration_decoded_video", 0.0)))
+    decoded_audio = float(media.get("duration_decoded_audio_end_pts", media.get("duration_decoded_audio", 0.0)))
+    video_gap = alignment - decoded_video if decoded_video > 0 else 0.0
+    audio_gap = alignment - decoded_audio if decoded_audio > 0 else 0.0
+    decoded_max = max(decoded_video, decoded_audio)
+    max_gap = alignment - decoded_max if decoded_max > 0 else 0.0
+    output_fps = max(float(config.get("video_output_fps", 25.0)), 1.0)
+    frame_count = max(int(config.get("duration_endpoint_video_frame_count", 2)), 1)
+    video_tolerance = max(
+        float(config.get("duration_endpoint_video_min_tolerance_s", 0.10)),
+        frame_count / output_fps,
+    )
+    audio_tolerance = float(config.get("duration_endpoint_audio_tolerance_s", 0.25))
+    negative_tolerance = float(config.get("duration_endpoint_negative_tolerance_s", 0.02))
+    issues: list[str] = []
+    if decoded_video > 0 and video_gap < -negative_tolerance:
+        issues.append("decoded_video_end_exceeds_alignment")
+    if decoded_audio > 0 and audio_gap < -negative_tolerance:
+        issues.append("decoded_audio_end_exceeds_alignment")
+    if decoded_video > 0 and video_gap > video_tolerance:
+        issues.append("video_edit_list_tail_exceeds_tolerance")
+    if decoded_audio > 0 and audio_gap > audio_tolerance:
+        issues.append("audio_edit_list_tail_exceeds_tolerance")
+    if issues:
+        status = "manual_review"
+    elif max(video_gap, audio_gap) > 0:
+        status = "accepted_edit_list_tail"
+    else:
+        status = "accepted_decoded_endpoint"
+    rule = (
+        "alignment=video_edit_list_presentation; positive decoded tail is outside decoded spans and remains mask=0; "
+        f"video_gap<=max({frame_count}/video_output_fps,{video_tolerance:.2f}s); "
+        f"audio_gap<={audio_tolerance:.2f}s; decoded_end may not exceed alignment by>{negative_tolerance:.2f}s"
+    )
+    explanation = (
+        "The alignment axis starts at the edit-list presentation zero. Decoded frame/packet endpoints can finish "
+        "earlier because of frame-center/packet-boundary quantization or edit-list padding. Positive tails are not "
+        "imputed: overlap pooling clips spans to the alignment grid and leaves uncovered bins masked."
+    )
+    return {
+        "duration_decoded_video_start_pts": float(media.get("duration_decoded_video_start_pts", 0.0)),
+        "duration_decoded_video_last_pts": float(media.get("duration_decoded_video_last_pts", 0.0)),
+        "duration_decoded_video_end_pts": decoded_video,
+        "duration_decoded_video_packet_count": int(media.get("duration_decoded_video_packet_count", 0)),
+        "duration_decoded_video_packet_duration": float(media.get("duration_decoded_video_packet_duration", 0.0)),
+        "duration_decoded_audio_start_pts": float(media.get("duration_decoded_audio_start_pts", 0.0)),
+        "duration_decoded_audio_last_pts": float(media.get("duration_decoded_audio_last_pts", 0.0)),
+        "duration_decoded_audio_end_pts": decoded_audio,
+        "duration_decoded_audio_packet_count": int(media.get("duration_decoded_audio_packet_count", 0)),
+        "duration_decoded_audio_packet_duration": float(media.get("duration_decoded_audio_packet_duration", 0.0)),
+        "duration_alignment_minus_decoded_video": float(video_gap),
+        "duration_alignment_minus_decoded_audio": float(audio_gap),
+        "duration_alignment_minus_decoded_max": float(max_gap),
+        "duration_endpoint_video_tolerance": float(video_tolerance),
+        "duration_endpoint_audio_tolerance": float(audio_tolerance),
+        "duration_endpoint_negative_tolerance": float(negative_tolerance),
+        "duration_endpoint_status": status,
+        "duration_endpoint_issues": ";".join(issues),
+        "duration_endpoint_rule": rule,
+        "duration_endpoint_explanation": explanation,
+    }
+
+
+def _text_review_conclusion(stats: dict[str, Any]) -> str:
+    status = str(stats.get("text_review_status", ""))
+    if status == "asr_empty_or_nonlexical_manual_review":
+        return "ASR为空或非词汇，词级时间定位不可依赖"
+    if status == "asr_text_mismatch_manual_review":
+        return "ASR与题目转写失配，保留低置信度回退时间并人工复核"
+    if status == "high_fallback_manual_review":
+        return "回退比例较高，作为低置信度文本并人工复核"
+    if status == "partial_invalid_timestamp_manual_review":
+        return "部分词缺少有效时间戳，保留无效原因并人工复核"
+    return "可作为常规文本对齐记录"
 
 
 def _empty_result(config: Q1Config, entry: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -493,23 +573,149 @@ Files:
 - `alignment_log.csv`: extraction, alignment and quality statistics.
 - `duration_audit.csv`: container, stream, decoded and selected alignment durations.
 - `text_review.csv`: per-sample ASR lexical coverage, fallback ratio and manual-review status.
+- `text_audit_summary.csv`: lightweight per-sample text conclusion for review and reuse.
 - `normalization.json`: per-modality z-score parameters computed from valid Question 1 bins.
 - `config.yaml`: resolved configuration and runtime versions.
 
 `processing_status` describes whether extraction completed. `quality_status` and `vision_status` separately identify degraded or missing modalities. Text fallback words remain traceable in the audit files and are represented by `text_confidence` and `text_low_confidence_mask`.
 
-The local audit directory contains unaligned sequences, raw timestamps, face tracks and detailed logs. It is intentionally excluded from the submission archive.
+`duration_alignment` is the video edit-list presentation axis. `duration_container` is retained for source-range checks. Positive decoded endpoint gaps are expected only within the recorded endpoint rule; the uncovered tail is not imputed and remains masked.
+
+The compact reproducibility archive additionally contains the Question 1 source code, the source configuration, environment snapshots, execution entry points, and typical-sample figures/sidecars. The full `q1_unaligned.pkl`, model weights, source videos and caches remain outside the archive.
 """
 
 
-def _zip_submission(submission_dir: Path, zip_path: Path) -> int:
+PACKAGE_REQUIRED_PATHS = [
+    "README.md",
+    "package_manifest.json",
+    "q1_submission/q1_aligned_50.pkl",
+    "q1_submission/manifest.csv",
+    "q1_submission/alignment_log.csv",
+    "q1_submission/duration_audit.csv",
+    "q1_submission/text_review.csv",
+    "q1_submission/text_audit_summary.csv",
+    "q1_submission/validation_report.json",
+    "code/q1/pipeline.py",
+    "code/q1/validate.py",
+    "code/q1/utils.py",
+    "config/q1.yaml",
+    "environment/environment.json",
+    "environment/pip_freeze.txt",
+    "tools/run_q1.sh",
+    "tools/validate_q1.sh",
+    "audit/typical_samples.json",
+]
+
+
+def _prepare_submission_package(
+    run_dir: Path,
+    submission_dir: Path,
+    audit_dir: Path,
+    environment_dir: Path,
+    config: Q1Config,
+    run_id: str,
+) -> Path:
+    package_root = run_dir / "outputs" / ".q1_package_staging"
+    if package_root.exists():
+        shutil.rmtree(package_root)
+    package_root.mkdir(parents=True, exist_ok=True)
+
+    for source in submission_dir.rglob("*"):
+        if source.is_file():
+            target = package_root / "q1_submission" / source.relative_to(submission_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+    for source in config.project_root.joinpath("q1").rglob("*.py"):
+        if "__pycache__" in source.parts:
+            continue
+        target = package_root / "code" / "q1" / source.relative_to(config.project_root / "q1")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+    config_target = package_root / "config" / config.path.name
+    config_target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(config.path, config_target)
+
+    for source in environment_dir.glob("*"):
+        if source.is_file():
+            target = package_root / "environment" / source.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+    for name in ("run_q1.sh", "run_q1.py", "validate_q1.sh"):
+        source = config.project_root / "tools" / name
+        if source.exists():
+            target = package_root / "tools" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+    for source in (audit_dir.iterdir() if audit_dir.exists() else []):
+        if not source.is_file():
+            continue
+        if source.suffix.lower() in {".png", ".json"} and (
+            source.name.startswith("typical_sample") or source.name == "typical_samples.json"
+        ):
+            target = package_root / "audit" / source.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+    (package_root / "README.md").write_text(
+        f"""# Question 1 reproducibility package
+
+Run ID: `{run_id}`
+
+This archive contains the Question 1 aligned feature output, the source code and configuration used to generate it, the remote environment snapshot, execution entry points, and typical-sample audit figures with sidecars.
+
+The alignment axis is the video edit-list presentation timeline. The container duration, decoded endpoints, endpoint differences, masks, fallback records and quality statuses are retained in `q1_submission/`.
+
+The full unaligned audit pickle, model weights, source videos and caches are intentionally excluded to keep the archive compact and independently reviewable.
+""",
+        encoding="utf-8",
+    )
+    write_json(
+        {
+            "schema_version": "q1.reproducibility_package.v1",
+            "run_id": run_id,
+            "required_paths": PACKAGE_REQUIRED_PATHS,
+            "excluded": ["q1_unaligned.pkl", "models", "source videos", "caches"],
+        },
+        package_root / "package_manifest.json",
+    )
+    return package_root
+
+
+def _zip_submission(package_root: Path, zip_path: Path) -> int:
     if zip_path.exists():
         zip_path.unlink()
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        for path in sorted(submission_dir.rglob("*")):
+        for path in sorted(package_root.rglob("*")):
             if path.is_file():
-                archive.write(path, path.relative_to(submission_dir.parent))
+                archive.write(path, path.relative_to(package_root))
     return zip_path.stat().st_size
+
+
+def _build_submission_zip(
+    run_dir: Path,
+    submission_dir: Path,
+    audit_dir: Path,
+    environment_dir: Path,
+    config: Q1Config,
+    run_id: str,
+    zip_path: Path,
+) -> int:
+    package_root = _prepare_submission_package(
+        run_dir,
+        submission_dir,
+        audit_dir,
+        environment_dir,
+        config,
+        run_id,
+    )
+    try:
+        return _zip_submission(package_root, zip_path)
+    finally:
+        shutil.rmtree(package_root, ignore_errors=True)
 
 
 def run_pipeline(
@@ -670,13 +876,17 @@ def run_pipeline(
                     "clip_id": entry["clip_id"],
                     "video_path": entry["video_path_relative"],
                     "sha256": entry["sha256"],
+                    "duration_container": entry["duration_container"],
+                    "duration_alignment": entry["duration_alignment"],
                     "duration_source": entry["duration_source"],
                     "text_fallback_ratio": result["stats"]["text_fallback_ratio"],
                     "text_review_status": result["stats"]["text_review_status"],
                     "vision_valid_ratio": result["stats"]["vision_valid_ratio"],
+                    "vision_status": result["vision_status"],
                     "quality_status": result["quality_status"],
+                    "processing_status": result["processing_status"],
                 }
-                for entry in manifest
+                for entry, result in zip(manifest, results)
             ],
         }
         artifact_path = submission_dir / "q1_aligned_50.pkl"
@@ -716,6 +926,9 @@ def run_pipeline(
                     "vision_imputed_ratio": result["stats"]["vision_imputed_ratio"],
                     "text_fallback_count": result["stats"]["text_fallback_count"],
                     "text_fallback_ratio": result["stats"]["text_fallback_ratio"],
+                    "text_word_count": result["stats"]["text_word_count"],
+                    "text_asr_word_count": result["stats"]["text_asr_word_count"],
+                    "text_invalid_timestamp_count": result["stats"]["text_invalid_timestamp_count"],
                     "text_low_confidence_ratio": result["stats"]["text_low_confidence_ratio"],
                     "text_timestamp_source": result["stats"]["text_timestamp_source"],
                     "text_lexical_asr_word_count": result["stats"]["text_lexical_asr_word_count"],
@@ -729,6 +942,11 @@ def run_pipeline(
                 "duration_container": entry["duration_container"],
                 "duration_alignment": entry["duration_alignment"],
                 "duration_source": entry["duration_source"],
+                "duration_alignment_minus_decoded_video": entry["duration_alignment_minus_decoded_video"],
+                "duration_alignment_minus_decoded_audio": entry["duration_alignment_minus_decoded_audio"],
+                "duration_alignment_minus_decoded_max": entry["duration_alignment_minus_decoded_max"],
+                "duration_endpoint_status": entry["duration_endpoint_status"],
+                "duration_endpoint_issues": entry["duration_endpoint_issues"],
                 "processing_status": result["processing_status"],
                 "quality_status": result["quality_status"],
                 "failure_reason": result["failure_reason"],
@@ -741,11 +959,21 @@ def run_pipeline(
             "duration_video_edit", "duration_audio_edit", "duration_decoded_video", "duration_decoded_audio",
             "duration_decoded", "duration_alignment", "duration_source", "duration_start_time",
             "video_edit_list_entries", "audio_edit_list_entries", "video_edit_list_present", "audio_edit_list_present",
+            "duration_decoded_video_start_pts", "duration_decoded_video_last_pts", "duration_decoded_video_end_pts",
+            "duration_decoded_video_packet_count", "duration_decoded_video_packet_duration",
+            "duration_decoded_audio_start_pts", "duration_decoded_audio_last_pts", "duration_decoded_audio_end_pts",
+            "duration_decoded_audio_packet_count", "duration_decoded_audio_packet_duration",
+            "duration_alignment_minus_decoded_video", "duration_alignment_minus_decoded_audio",
+            "duration_alignment_minus_decoded_max", "duration_endpoint_video_tolerance",
+            "duration_endpoint_audio_tolerance", "duration_endpoint_negative_tolerance",
+            "duration_endpoint_status", "duration_endpoint_issues", "duration_endpoint_rule",
+            "duration_endpoint_explanation",
             "audio_sample_rate_original", "video_fps", "video_width", "video_height", "text_length", "audio_length",
             "vision_length", "feature_dim_text", "feature_dim_audio", "feature_dim_vision", "aligned_length",
             "alignment_granularity", "feature_status", "processing_status", "quality_status", "text_status",
             "audio_status", "vision_status", "vision_failure_reason", "vision_valid_ratio",
             "vision_face_detection_ratio", "vision_imputed_ratio", "text_fallback_count", "text_fallback_ratio",
+            "text_word_count", "text_asr_word_count", "text_invalid_timestamp_count",
             "text_low_confidence_ratio", "text_timestamp_source", "failure_reason", "sha256",
             "text_lexical_asr_word_count", "text_review_status",
         ]
@@ -773,11 +1001,43 @@ def run_pipeline(
                 "fallback_ratio", "invalid_timestamp_count", "review_status", "asr_words",
             ],
         )
+        write_csv(
+            [
+                {
+                    "id": entry["id"],
+                    "word_count": result["stats"]["text_word_count"],
+                    "asr_word_count": result["stats"]["text_asr_word_count"],
+                    "lexical_asr_word_count": result["stats"]["text_lexical_asr_word_count"],
+                    "fallback_count": result["stats"]["text_fallback_count"],
+                    "fallback_ratio": result["stats"]["text_fallback_ratio"],
+                    "invalid_timestamp_count": result["stats"]["text_invalid_timestamp_count"],
+                    "review_status": result["stats"]["text_review_status"],
+                    "manual_review_required": int(result["stats"]["text_review_status"] != "normal"),
+                    "conclusion": _text_review_conclusion(result["stats"]),
+                }
+                for entry, result in zip(manifest, results)
+            ],
+            submission_dir / "text_audit_summary.csv",
+            [
+                "id", "word_count", "asr_word_count", "lexical_asr_word_count", "fallback_count",
+                "fallback_ratio", "invalid_timestamp_count", "review_status", "manual_review_required",
+                "conclusion",
+            ],
+        )
         duration_fields = [
             "id", "duration_container", "duration_format", "duration_mvhd", "duration_video_stream", "duration_audio_stream",
             "duration_video_edit", "duration_audio_edit", "duration_decoded_video", "duration_decoded_audio",
             "duration_decoded", "duration_alignment", "duration_source", "duration_start_time",
             "video_edit_list_entries", "audio_edit_list_entries", "video_edit_list_present", "audio_edit_list_present",
+            "duration_decoded_video_start_pts", "duration_decoded_video_last_pts", "duration_decoded_video_end_pts",
+            "duration_decoded_video_packet_count", "duration_decoded_video_packet_duration",
+            "duration_decoded_audio_start_pts", "duration_decoded_audio_last_pts", "duration_decoded_audio_end_pts",
+            "duration_decoded_audio_packet_count", "duration_decoded_audio_packet_duration",
+            "duration_alignment_minus_decoded_video", "duration_alignment_minus_decoded_audio",
+            "duration_alignment_minus_decoded_max", "duration_endpoint_video_tolerance",
+            "duration_endpoint_audio_tolerance", "duration_endpoint_negative_tolerance",
+            "duration_endpoint_status", "duration_endpoint_issues", "duration_endpoint_rule",
+            "duration_endpoint_explanation",
         ]
         write_csv(manifest_rows, submission_dir / "duration_audit.csv", duration_fields)
 
@@ -865,7 +1125,7 @@ def run_pipeline(
             except Exception as exc:
                 logger.warning("Typical sample visualization was not generated: %s", exc)
 
-        from .validate import validate_artifact
+        from .validate import validate_artifact, validate_submission_package
 
         raw_audit_path = audit_dir / "q1_unaligned.pkl"
         validation = validate_artifact(
@@ -875,19 +1135,59 @@ def run_pipeline(
             require_complete=bool(config.get("require_all_samples_complete", True)) and not allow_failures,
             manifest_path=submission_dir / "manifest.csv",
             raw_audit_path=raw_audit_path if raw_audit_path.exists() else None,
+            alignment_log_path=submission_dir / "alignment_log.csv",
+            text_review_path=submission_dir / "text_review.csv",
+            duration_audit_path=submission_dir / "duration_audit.csv",
         )
         write_json(validation, submission_dir / "validation_report.json")
         if validation["errors"]:
             raise RuntimeError("Output validation failed: " + "; ".join(validation["errors"]))
 
         zip_path = run_dir / "outputs" / f"q1_submission_{run_id}.zip"
-        zip_bytes = _zip_submission(submission_dir, zip_path)
+        zip_bytes = _build_submission_zip(
+            run_dir,
+            submission_dir,
+            audit_dir,
+            run_dir / "environment",
+            config,
+            run_id,
+            zip_path,
+        )
+        package_report = validate_submission_package(zip_path, PACKAGE_REQUIRED_PATHS)
+        validation["package"] = package_report
+        validation["conclusions"]["reproducibility_package"] = "passed" if not package_report["errors"] else "failed"
+        validation["conclusions"]["overall"] = (
+            "passed_with_quality_conditions"
+            if validation["conclusions"].get("structure") == "passed" and not package_report["errors"]
+            else "blocked"
+        )
+        validation["errors"].extend(package_report["errors"])
+        validation["warnings"].extend(package_report["warnings"])
+        write_json(validation, submission_dir / "validation_report.json")
+        if validation["errors"]:
+            raise RuntimeError("Submission package validation failed: " + "; ".join(validation["errors"]))
+
+        # Rebuild so the final archive contains the final validation report.
+        zip_bytes = _build_submission_zip(
+            run_dir,
+            submission_dir,
+            audit_dir,
+            run_dir / "environment",
+            config,
+            run_id,
+            zip_path,
+        )
+        final_package_report = validate_submission_package(zip_path, PACKAGE_REQUIRED_PATHS)
+        if final_package_report["errors"]:
+            raise RuntimeError("Final submission package validation failed: " + "; ".join(final_package_report["errors"]))
         write_json(
             {
-                "uncompressed_bytes": sum(path.stat().st_size for path in submission_dir.rglob("*") if path.is_file()),
+                "uncompressed_submission_bytes": sum(path.stat().st_size for path in submission_dir.rglob("*") if path.is_file()),
                 "compressed_bytes": zip_bytes,
                 "limit_bytes": int(config.get("submission_max_bytes", 52_428_800)),
                 "within_limit": zip_bytes <= int(config.get("submission_max_bytes", 52_428_800)),
+                "package_file_count": final_package_report["file_count"],
+                "required_paths": PACKAGE_REQUIRED_PATHS,
             },
             submission_dir / "package_size.json",
         )

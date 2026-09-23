@@ -120,8 +120,23 @@ def _optional_float(value: Any) -> float:
     return number if math.isfinite(number) and number > 0 else 0.0
 
 
-def _decoded_stream_duration(path: Path, selector: str) -> float:
-    """Return the last decoded frame/packet end on FFmpeg's presentation timeline."""
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _decoded_stream_timing(path: Path, selector: str) -> dict[str, Any]:
+    """Return decoded presentation endpoints and packet statistics."""
+    empty = {
+        "first_pts": 0.0,
+        "last_pts": 0.0,
+        "end_pts": 0.0,
+        "packet_count": 0,
+        "median_packet_duration": 0.0,
+    }
     try:
         result = run_command(
             [
@@ -139,17 +154,40 @@ def _decoded_stream_duration(path: Path, selector: str) -> float:
             ]
         )
     except subprocess.CalledProcessError:
-        return 0.0
+        return empty
+    first_pts: float | None = None
+    last_pts: float | None = None
     last_end = 0.0
+    packet_durations: list[float] = []
+    packet_count = 0
     for line in result.stdout.decode("utf-8", errors="replace").splitlines():
         values = [item.strip() for item in line.split(",")]
         if not values:
             continue
-        timestamp = _optional_float(values[0])
-        packet_duration = _optional_float(values[1]) if len(values) > 1 else 0.0
-        if timestamp or packet_duration:
-            last_end = max(last_end, timestamp + packet_duration, timestamp)
-    return last_end
+        timestamp = _finite_float(values[0])
+        packet_duration = _finite_float(values[1]) if len(values) > 1 else None
+        if timestamp is None:
+            continue
+        packet_count += 1
+        first_pts = timestamp if first_pts is None else min(first_pts, timestamp)
+        last_pts = timestamp if last_pts is None else max(last_pts, timestamp)
+        if packet_duration is not None and packet_duration > 0:
+            packet_durations.append(packet_duration)
+        last_end = max(last_end, timestamp + max(packet_duration or 0.0, 0.0), timestamp)
+    if first_pts is None or last_pts is None:
+        return empty
+    return {
+        "first_pts": float(first_pts),
+        "last_pts": float(last_pts),
+        "end_pts": float(last_end),
+        "packet_count": int(packet_count),
+        "median_packet_duration": float(np.median(packet_durations)) if packet_durations else 0.0,
+    }
+
+
+def _decoded_stream_duration(path: Path, selector: str) -> float:
+    """Return the last decoded frame/packet end on FFmpeg's presentation timeline."""
+    return float(_decoded_stream_timing(path, selector)["end_pts"])
 
 
 def _iter_mp4_boxes(blob: bytes, start: int, end: int) -> Iterable[tuple[str, int, int]]:
@@ -302,8 +340,10 @@ def probe_media(path: Path) -> dict[str, Any]:
     duration_container = duration_mvhd
     duration_video_edit = _optional_float(mp4_timing.get("duration_video_edit")) or duration_video_stream
     duration_audio_edit = _optional_float(mp4_timing.get("duration_audio_edit")) or duration_audio_stream
-    duration_decoded_video = _decoded_stream_duration(path, "v:0")
-    duration_decoded_audio = _decoded_stream_duration(path, "a:0")
+    video_timing = _decoded_stream_timing(path, "v:0")
+    audio_timing = _decoded_stream_timing(path, "a:0")
+    duration_decoded_video = float(video_timing["end_pts"])
+    duration_decoded_audio = float(audio_timing["end_pts"])
     duration_decoded = max(duration_decoded_video, duration_decoded_audio)
     duration_alignment = duration_video_edit or duration_audio_edit or duration_decoded or duration_container
     if mp4_timing.get("duration_video_edit"):
@@ -336,6 +376,16 @@ def probe_media(path: Path) -> dict[str, Any]:
         "duration_decoded_video": duration_decoded_video,
         "duration_decoded_audio": duration_decoded_audio,
         "duration_decoded": duration_decoded,
+        "duration_decoded_video_start_pts": float(video_timing["first_pts"]),
+        "duration_decoded_video_last_pts": float(video_timing["last_pts"]),
+        "duration_decoded_video_end_pts": float(video_timing["end_pts"]),
+        "duration_decoded_video_packet_count": int(video_timing["packet_count"]),
+        "duration_decoded_video_packet_duration": float(video_timing["median_packet_duration"]),
+        "duration_decoded_audio_start_pts": float(audio_timing["first_pts"]),
+        "duration_decoded_audio_last_pts": float(audio_timing["last_pts"]),
+        "duration_decoded_audio_end_pts": float(audio_timing["end_pts"]),
+        "duration_decoded_audio_packet_count": int(audio_timing["packet_count"]),
+        "duration_decoded_audio_packet_duration": float(audio_timing["median_packet_duration"]),
         "duration_alignment": duration_alignment,
         "duration_source": duration_source,
         "duration_start_time": _optional_float(video.get("start_time")),

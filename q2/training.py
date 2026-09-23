@@ -20,7 +20,14 @@ from .checkpoint import (
 from .data import SplitData
 from .evaluation import evaluate_scenarios, evaluate_split
 from .losses import distillation_loss, supervised_loss
-from .masking import MaskScenario, generate_contiguous_block_masks, generate_random_point_masks, stack_masks, unstack_masks
+from .masking import (
+    MaskScenario,
+    apply_whole_modality_dropout,
+    generate_contiguous_block_masks,
+    generate_random_point_masks,
+    stack_masks,
+    unstack_masks,
+)
 from .model import RobustGatedTemporalFusion, build_model
 from .torchdata import make_loader
 
@@ -51,12 +58,27 @@ def set_global_seed(seed: int, deterministic: bool = True) -> None:
             torch.backends.cudnn.benchmark = False
 
 
-def class_weights_from_training(split: SplitData, enabled: bool = True) -> np.ndarray:
-    if not enabled:
+def class_weights_from_training(
+    split: SplitData,
+    enabled: bool = True,
+    mode: str = "sqrt_inverse",
+) -> np.ndarray:
+    mode = str(mode).lower()
+    if not enabled or mode in {"none", "uniform"}:
         return np.ones(3, dtype=np.float32)
     counts = np.bincount(split.classification, minlength=3).astype(np.float64)
     safe = np.maximum(counts, 1.0)
-    weights = 1.0 / np.sqrt(safe)
+    if mode == "sqrt_inverse":
+        weights = 1.0 / np.sqrt(safe)
+    elif mode == "inverse":
+        weights = 1.0 / safe
+    elif mode == "effective":
+        beta = 0.9999
+        weights = (1.0 - beta) / (1.0 - np.power(beta, safe))
+    else:
+        raise ValueError(
+            "class_weight_mode must be one of: none, sqrt_inverse, inverse, effective"
+        )
     weights /= weights.mean()
     return weights.astype(np.float32)
 
@@ -156,6 +178,9 @@ def train_one_model(
     augmentation_probability = float(training_config.get("mask_augmentation_probability", 0.75))
     max_fraction = float(training_config.get("mask_max_fraction", 0.60))
     random_point_fraction = float(training_config.get("random_point_fraction", 0.20))
+    whole_modality_dropout_probability = float(
+        training_config.get("whole_modality_dropout_probability", 0.0)
+    )
     gradient_clip = float(training_config.get("gradient_clip_norm", 1.0))
     num_workers = int(training_config.get("num_workers", 0))
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -276,6 +301,13 @@ def train_one_model(
                         rng,
                         probability=augmentation_probability,
                         max_fraction=max_fraction,
+                    )
+                if whole_modality_dropout_probability > 0.0:
+                    augmented_numpy = apply_whole_modality_dropout(
+                        augmented_numpy,
+                        rng,
+                        probability=whole_modality_dropout_probability,
+                        keep_at_least_one_modality=True,
                     )
                 augmented_masks = torch.from_numpy(augmented_numpy).to(device_obj)
             else:
