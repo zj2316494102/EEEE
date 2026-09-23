@@ -19,9 +19,32 @@ def supervised_loss(
     class_weights: Tensor | None = None,
     lambda_regression: float = 1.0,
     lambda_consistency: float = 0.05,
+    label_smoothing: float = 0.0,
+    focal_gamma: float = 0.0,
 ) -> tuple[Tensor, dict[str, float]]:
     probabilities = torch.softmax(logits, dim=-1)
-    ce = F.cross_entropy(logits, classification.long(), weight=class_weights)
+    label_smoothing = float(max(0.0, min(0.99, label_smoothing)))
+    focal_gamma = float(max(0.0, focal_gamma))
+    if focal_gamma > 0.0:
+        per_sample = F.cross_entropy(
+            logits,
+            classification.long(),
+            reduction="none",
+            label_smoothing=label_smoothing,
+        )
+        focal_factor = (1.0 - torch.exp(-per_sample)).pow(focal_gamma)
+        if class_weights is not None:
+            sample_weights = class_weights[classification.long()]
+            ce = (per_sample * focal_factor * sample_weights).mean()
+        else:
+            ce = (per_sample * focal_factor).mean()
+    else:
+        ce = F.cross_entropy(
+            logits,
+            classification.long(),
+            weight=class_weights,
+            label_smoothing=label_smoothing,
+        )
     huber = F.huber_loss(intensity, regression.float(), delta=1.0)
     consistency = consistency_loss(probabilities, intensity)
     total = ce + float(lambda_regression) * huber + float(lambda_consistency) * consistency
@@ -52,4 +75,3 @@ def distillation_loss(
         "kl": float(kl.detach().cpu()),
         "teacher_huber": float(regression.detach().cpu()),
     }
-

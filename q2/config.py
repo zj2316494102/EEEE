@@ -55,6 +55,7 @@ class Q2Config:
     @property
     def model_kwargs(self) -> dict[str, Any]:
         keys = (
+            "model_type",
             "projection_dim",
             "transformer_layers",
             "attention_heads",
@@ -64,6 +65,11 @@ class Q2Config:
             "fusion",
             "use_transformer",
             "use_coverage_features",
+            "hidden_dim",
+            "expert_dim",
+            "v2_hidden_dim",
+            "v2_expert_dim",
+            "classifier_mode",
         )
         return {key: self.get(key) for key in keys if key in self.values}
 
@@ -89,4 +95,3 @@ def dump_yaml(values: Mapping[str, Any], path: str | Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(dict(values), handle, allow_unicode=True, sort_keys=False)
-

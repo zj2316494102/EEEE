@@ -7,7 +7,11 @@ label_path: E题数据/附件2-数据集特征文件/label.xlsx
 attachment3_aligned_dir: E题数据/附件3-模态缺失特征样本/对齐版本
 run_root: runs
 
-# Dynamic-gated temporal fusion model.
+# V2: statistics-enhanced modality experts with mask-aware late fusion.
+model_type: late_fusion_v2
+hidden_dim: 96
+expert_dim: 128
+classifier_mode: two_stage
 projection_dim: 128
 transformer_layers: 2
 attention_heads: 4
@@ -31,6 +35,8 @@ gradient_clip_norm: 1.0
 num_workers: 0
 use_class_weights: true
 class_weight_mode: sqrt_inverse
+label_smoothing: 0.02
+focal_gamma: 0.0
 mask_augmentation_probability: 0.75
 mask_max_fraction: 0.60
 random_point_fraction: 0.20

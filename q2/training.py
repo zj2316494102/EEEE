@@ -172,6 +172,8 @@ def train_one_model(
     weight_decay = float(training_config.get("weight_decay", 1e-4))
     lambda_regression = float(training_config.get("lambda_regression", 1.0))
     lambda_consistency = float(training_config.get("lambda_consistency", 0.05))
+    label_smoothing = float(training_config.get("label_smoothing", 0.0))
+    focal_gamma = float(training_config.get("focal_gamma", 0.0))
     distill_weight = float(training_config.get("distill_weight", 0.0)) if teacher is not None else 0.0
     distill_temperature = float(training_config.get("distill_temperature", 2.0))
     distill_regression_weight = float(training_config.get("distill_regression_weight", 0.5))
@@ -328,6 +330,8 @@ def train_one_model(
                 class_weights=weights,
                 lambda_regression=lambda_regression,
                 lambda_consistency=lambda_consistency,
+                label_smoothing=label_smoothing,
+                focal_gamma=focal_gamma,
             )
             if teacher is not None and distill_weight > 0:
                 with torch.no_grad():
