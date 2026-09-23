@@ -21,3 +21,22 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+
+# Project-local environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.env
+.DS_Store
+~$*
+
+# Local datasets and experiment results
+E题数据/
+results/
+*.pkl
+
+# Downloaded model weights and caches; model metadata remains tracked
+models/**/.cache/
+models/**/*.safetensors
+models/**/*.bin

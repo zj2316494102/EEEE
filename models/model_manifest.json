@@ -1,0 +1,176 @@
+{
+  "generated_at": "2026-09-23T10:04:26+0800",
+  "huggingface_hub_version": "1.32.0",
+  "models": [
+    {
+      "name": "text",
+      "repo_id": "answerdotai/ModernBERT-base",
+      "revision": "8949b909ec900327062f0ebf497f51aef5e6f0c8",
+      "local_dir": "C:\\Users\\zzz\\Desktop\\E题\\models\\answerdotai--ModernBERT-base",
+      "files": [
+        {
+          "path": "config.json",
+          "size_bytes": 1193,
+          "sha256": "1609d59e627c33eaed524b4f01e546d42e84190a079a5a5ded84b212c41c324f"
+        },
+        {
+          "path": "model.safetensors",
+          "size_bytes": 598635032,
+          "sha256": "340ac08b74eef0d7bdec2d7981a6a3d4249bf0e6aab60634b72ad02c2b8023a9"
+        },
+        {
+          "path": "README.md",
+          "size_bytes": 8427,
+          "sha256": "40539466fa1117be4693b8f1fdfdac81fac3c5db472ff57bc05d013d48eafa82"
+        },
+        {
+          "path": "special_tokens_map.json",
+          "size_bytes": 694,
+          "sha256": "ea97ecdbcc73713039d8d64dbb05e3689495c96657fbd9a18f5bed381be81049"
+        },
+        {
+          "path": "tokenizer.json",
+          "size_bytes": 2132967,
+          "sha256": "9fd55248d51d33976b324fc11592e28071da7d41e0e9401dfb7082e30574b7b1"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "size_bytes": 20810,
+          "sha256": "3cd2017ff46d0a527e5d39cae39272eccfa1f19bb9f89b05d166aab2e38354e2"
+        }
+      ],
+      "total_size_bytes": 600799123,
+      "elapsed_seconds": 37.2
+    },
+    {
+      "name": "asr_timestamp",
+      "repo_id": "openai/whisper-large-v3-turbo",
+      "revision": "41f01f3fe87f28c78e2fbf8b568835947dd65ed9",
+      "local_dir": "C:\\Users\\zzz\\Desktop\\E题\\models\\openai--whisper-large-v3-turbo",
+      "files": [
+        {
+          "path": "added_tokens.json",
+          "size_bytes": 34648,
+          "sha256": "3c51f66c4c21f9e126970078f11ae77a78c74aee8df606ee9daba86e467108e0"
+        },
+        {
+          "path": "config.json",
+          "size_bytes": 1256,
+          "sha256": "c5b526b3e3cd64cd8940dabb45e8ba726629e22d8ed389c29b552f9140daf04a"
+        },
+        {
+          "path": "generation_config.json",
+          "size_bytes": 3772,
+          "sha256": "cce11bfe3aaa6ae9e072ea2637caaec8795e68d9b67e655a5af16ee509681a4c"
+        },
+        {
+          "path": "merges.txt",
+          "size_bytes": 493869,
+          "sha256": "2df2990a395e35e8dfbc7511e08c12d56018d8d04691e0133e5d63b21e154dc6"
+        },
+        {
+          "path": "model.safetensors",
+          "size_bytes": 1617824864,
+          "sha256": "542566a422ae4f3fd23f1ba11add198fca01bbf82e66e6a2857b3f608b1eb9d1"
+        },
+        {
+          "path": "normalizer.json",
+          "size_bytes": 52666,
+          "sha256": "bf1c507dc8724ca9cf9903640dacfb69dae2f00edee4f21ceba106a7392f26dd"
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size_bytes": 340,
+          "sha256": "7ccc62c6f2765af1f3b46c00c9b5894426835a05021c8b9c01eecb6dfb542711"
+        },
+        {
+          "path": "README.md",
+          "size_bytes": 21196,
+          "sha256": "aaef74a740faca90fa1899c4233ebe17f2093b9846d0acf16d9131bf650e9585"
+        },
+        {
+          "path": "special_tokens_map.json",
+          "size_bytes": 2186,
+          "sha256": "baea4ea09372eb4fca86b4e4346139fd73cb807d5087e9de0948e971739c3e74"
+        },
+        {
+          "path": "tokenizer.json",
+          "size_bytes": 2710337,
+          "sha256": "297b13372ac43916285644fb9687add3cc62ee2a1adb60da3dc25cc94c1871fd"
+        },
+        {
+          "path": "tokenizer_config.json",
+          "size_bytes": 282843,
+          "sha256": "844b642c73a91359722f47b35705f7174686df33d252695d8572cf9ac03a6389"
+        },
+        {
+          "path": "vocab.json",
+          "size_bytes": 1036558,
+          "sha256": "e2aa043ef015641d363d8288e7c241c85e36a5c761fb303598e0710233344387"
+        }
+      ],
+      "total_size_bytes": 1622464535,
+      "elapsed_seconds": 94.1
+    },
+    {
+      "name": "audio",
+      "repo_id": "microsoft/wavlm-base-plus",
+      "revision": "4c66d4806a428f2e922ccfa1a962776e232d487b",
+      "local_dir": "C:\\Users\\zzz\\Desktop\\E题\\models\\microsoft--wavlm-base-plus",
+      "files": [
+        {
+          "path": "config.json",
+          "size_bytes": 2232,
+          "sha256": "fea6df1c2700a3954fc07e70588aecc9055eeb28db2ff57151a2db0d19180ed4"
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size_bytes": 215,
+          "sha256": "99272fe8ccfab114b68b478681ea47ee3a1ce62bb788cb92dd6e4f69fb1f1da2"
+        },
+        {
+          "path": "pytorch_model.bin",
+          "size_bytes": 377617425,
+          "sha256": "3bb273a6ace99408b50cfc81afdbb7ef2de02da2eab0234e18db608ce692fe51"
+        },
+        {
+          "path": "README.md",
+          "size_bytes": 3904,
+          "sha256": "d417fc16b08e2f66f0af6b371e47a5f9f1f596f6c1c593f1214d360c41d7a27e"
+        }
+      ],
+      "total_size_bytes": 377623776,
+      "elapsed_seconds": 18.2
+    },
+    {
+      "name": "vision",
+      "repo_id": "dima806/facial_emotions_image_detection",
+      "revision": "747cf16692eea925b54b7b543cf436848128b68d",
+      "local_dir": "C:\\Users\\zzz\\Desktop\\E题\\models\\dima806--facial_emotions_image_detection",
+      "files": [
+        {
+          "path": "config.json",
+          "size_bytes": 907,
+          "sha256": "712a487fa767670ae4aa1046bc47cea47bc6a260ffe49a87a51ff998a5e163cb"
+        },
+        {
+          "path": "model.safetensors",
+          "size_bytes": 343239356,
+          "sha256": "ffad6b9e5cb20d4857f4b532c2543055d7d0e7e1422ab7469087edaab82f8dd8"
+        },
+        {
+          "path": "preprocessor_config.json",
+          "size_bytes": 578,
+          "sha256": "ff4f6287fdbe3e1e291b826aa8b7d8e7d7789a1b8a3cc62c817391b5d9e6aa4a"
+        },
+        {
+          "path": "README.md",
+          "size_bytes": 1020,
+          "sha256": "e91fadb8a6cde8f428de70e90042ac73efeb5e2170ec8c1632fd48362b83415b"
+        }
+      ],
+      "total_size_bytes": 343241861,
+      "elapsed_seconds": 24.8
+    }
+  ]
+}
