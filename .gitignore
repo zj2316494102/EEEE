@@ -30,6 +30,7 @@ __pycache__/
 .env
 .DS_Store
 ~$*
+.qa_question1/
 
 # Local datasets and experiment results
 E题数据/
